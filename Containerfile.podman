@@ -1,0 +1,22 @@
+FROM fedora:42
+
+RUN dnf -y update && \
+    dnf -y install \
+      diffutils \
+      findutils \
+      git \
+      glslang \
+      make \
+      meson \
+      mingw32-gcc-c++ \
+      mingw32-winpthreads-static \
+      ninja-build \
+      pkgconf-pkg-config \
+      python3 \
+      tar \
+      xz && \
+    dnf clean all
+
+WORKDIR /src
+
+CMD ["/bin/bash"]
