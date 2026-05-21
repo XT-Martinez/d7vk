@@ -42,6 +42,7 @@ ddraw_src = [
   'd3d6/d3d6_texture.cpp',
   'd3d6/d3d6_viewport.cpp',
   'd3d7/d3d7_buffer.cpp',
+  'd3d7/d3d7_direct_renderer.cpp',
   'd3d7/d3d7_interface.cpp',
   'd3d7/d3d7_device.cpp',
   'd3d7/d3d7_state_block.cpp',

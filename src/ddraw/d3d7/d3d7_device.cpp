@@ -5,6 +5,7 @@
 #include "../ddraw_common_interface.h"
 
 #include "d3d7_buffer.h"
+#include "d3d7_direct_renderer.h"
 #include "d3d7_state_block.h"
 
 #include "../ddraw7/ddraw7_surface.h"
@@ -36,6 +37,13 @@ namespace dxvk {
       m_batchDrawsEnabled = value == "1" || value == "true" || value == "True" || value == "TRUE";
       if (m_batchDrawsEnabled)
         m_batchVertices.reserve(64u * 1024u);
+    }
+
+    {
+      std::string value = env::getEnvVar("D7VK_DIRECT_VULKAN");
+      const bool directVulkan = value == "1" || value == "true" || value == "True" || value == "TRUE";
+      if (directVulkan)
+        m_directRenderer = std::make_unique<D3D7DirectRenderer>(this);
     }
 
     if (m_parent != nullptr) {

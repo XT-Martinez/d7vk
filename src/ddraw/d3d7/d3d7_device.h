@@ -16,6 +16,7 @@
 #include "d3d7_interface.h"
 
 #include <array>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -25,6 +26,7 @@ namespace dxvk {
   class DDrawCommonInterface;
   class DDraw7Surface;
   class D3D7StateBlock;
+  class D3D7DirectRenderer;
 
   /**
   * \brief D3D7 device implementation
@@ -261,6 +263,10 @@ namespace dxvk {
     uint32_t              m_batchFvfSize      = 0;
     uint32_t              m_batchVertexCount  = 0;
     std::vector<uint8_t>  m_batchVertices;
+
+    // Optional D3D7 -> Vulkan direct path. Allocated only when D7VK_DIRECT_VULKAN
+    // is set. Phase 0 skeleton: object exists but no entry points route to it yet.
+    std::unique_ptr<D3D7DirectRenderer> m_directRenderer;
 
   };
 
