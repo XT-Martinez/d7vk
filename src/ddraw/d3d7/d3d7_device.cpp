@@ -432,10 +432,19 @@ namespace dxvk {
 
     FlushDrawBatch();
 
-    HRESULT hr = m_commonD3DDevice->GetD3D9Device()->Clear(count, rects, flags, color, static_cast<float>(z), stencil);
-    if (unlikely(FAILED(hr))) {
-      Logger::debug("D3D7Device::Clear: Failed D3D9 Clear call");
-      return hr;
+    // Try the direct-Vulkan path first; it color-clears via DxvkContext
+    // and delegates any depth/stencil portion back to D3D9 itself. If it
+    // declines (e.g. rect-clears), we fall through to D9 entirely.
+    bool routedDirect = false;
+    if (m_directRenderer != nullptr)
+      routedDirect = m_directRenderer->Clear(flags, count, rects, color, static_cast<float>(z), stencil);
+
+    if (!routedDirect) {
+      HRESULT hr = m_commonD3DDevice->GetD3D9Device()->Clear(count, rects, flags, color, static_cast<float>(z), stencil);
+      if (unlikely(FAILED(hr))) {
+        Logger::debug("D3D7Device::Clear: Failed D3D9 Clear call");
+        return hr;
+      }
     }
 
     const bool clearRenderTarget = flags & D3DCLEAR_TARGET;

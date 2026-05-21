@@ -120,6 +120,10 @@ namespace dxvk {
     return m_device->GetDXVKDevice().ptr();
   }
 
+  void DxvkD3D8Bridge::EmitDirectClearRenderTarget(float r, float g, float b, float a) {
+    m_device->EmitDirectClearRenderTarget(r, g, b, a);
+  }
+
   DxvkD3D8InterfaceBridge::DxvkD3D8InterfaceBridge(D3D9InterfaceEx* pObject)
     : m_interface(pObject) {
   }

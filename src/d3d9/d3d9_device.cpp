@@ -2115,6 +2115,33 @@ namespace dxvk {
   }
 
 
+  void D3D9DeviceEx::EmitDirectClearRenderTarget(float r, float g, float b, float a) {
+    D3D9DeviceLock lock = LockDevice();
+    BindFramebuffer();
+
+    if (!HasRenderTargetBound(0))
+      return;
+
+    const bool srgb = m_state.renderStates[D3DRS_SRGBWRITEENABLE];
+    auto rtv = m_state.renderTargets[0]->GetRenderTargetView(srgb);
+    if (rtv == nullptr)
+      return;
+
+    VkClearValue clearValue;
+    clearValue.color.float32[0] = r;
+    clearValue.color.float32[1] = g;
+    clearValue.color.float32[2] = b;
+    clearValue.color.float32[3] = a;
+
+    EmitCs([
+      cClearValue = clearValue,
+      cImageView  = rtv
+    ] (DxvkContext* ctx) {
+      ctx->clearRenderTarget(cImageView, VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
+    });
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetTransform(D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix) {
     D3D9DeviceLock lock = LockDevice();
 

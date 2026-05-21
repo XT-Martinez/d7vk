@@ -817,6 +817,12 @@ namespace dxvk {
       return m_dxvkDevice;
     }
 
+    // Internal entry point used by the D7VK direct-Vulkan path. Emits a
+    // raw clearRenderTarget command for render target 0 on this device's
+    // CS thread, bypassing D3D9's own Clear() logic. Intended only for
+    // experimentation; produces no Z/stencil clear and ignores rects.
+    void EmitDirectClearRenderTarget(float r, float g, float b, float a);
+
     D3D9_VK_FORMAT_MAPPING LookupFormat(
       D3D9Format            Format) const;
 

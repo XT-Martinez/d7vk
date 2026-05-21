@@ -165,6 +165,12 @@ namespace dxvk {
     // Not part of the IDxvkD3D8Bridge COM ABI.
     DxvkDevice* GetDXVKDevice() const;
 
+    // Internal D7VK direct-path hook: emits a clearRenderTarget command for
+    // render target 0 on the D3D9 device's CS thread. Used to verify that
+    // direct DxvkContext writes interleave correctly with the D3D9 layer's
+    // own draws and present. Not part of the IDxvkD3D8Bridge COM ABI.
+    void EmitDirectClearRenderTarget(float r, float g, float b, float a);
+
   private:
 
     D3D9DeviceEx* m_device;

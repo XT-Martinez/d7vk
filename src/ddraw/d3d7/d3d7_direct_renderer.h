@@ -29,12 +29,31 @@ namespace dxvk {
     D3D7DirectRenderer             (const D3D7DirectRenderer&) = delete;
     D3D7DirectRenderer& operator = (const D3D7DirectRenderer&) = delete;
 
+    // True once the renderer has acquired all dependencies and is safe to
+    // route entry points through.
+    bool IsActive() const { return m_dxvkDevice != nullptr; }
+
+    // Phase 1.2: route the color portion of Clear through
+    // DxvkContext::clearRenderTarget directly. Any depth/stencil portion
+    // is delegated to D3D9 in the same call. Returns true if the caller
+    // should consider the Clear handled (do NOT also call D9's Clear).
+    // Returns false to fall through to D9 entirely (e.g. for rect-clears
+    // we haven't implemented yet).
+    bool Clear(DWORD flags, DWORD count, D3DRECT* rects, D3DCOLOR color,
+               float z, DWORD stencil);
+
   private:
 
     // Non-owning. Lifetime is bound by the D3D9 device that the D3D7Device
     // holds; that device keeps a Rc<DxvkDevice> alive for us.
     D3D7Device*  m_device     = nullptr;
     DxvkDevice*  m_dxvkDevice = nullptr;
+
+    bool m_directClearLogged = false;
+    // Debug: when D7VK_DIRECT_CLEAR_DEBUG=1, force every direct color
+    // clear to magenta so we can visually confirm our DxvkContext writes
+    // are what reach the screen.
+    bool m_directClearDebug  = false;
 
   };
 
