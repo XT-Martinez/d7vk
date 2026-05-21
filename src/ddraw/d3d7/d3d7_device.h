@@ -17,6 +17,7 @@
 
 #include <array>
 #include <unordered_map>
+#include <vector>
 
 namespace dxvk {
 
@@ -191,6 +192,10 @@ namespace dxvk {
 
     inline bool ShouldRecord() const { return m_recorder != nullptr; }
 
+    void InvalidateDedupCaches();
+
+    void FlushDrawBatch();
+
     inline void RefreshLastUsedDevice() {
       if (unlikely(m_commonIntf->GetCommonD3DDevice() != m_commonD3DDevice.ptr()))
         m_commonIntf->SetCommonD3DDevice(m_commonD3DDevice.ptr());
@@ -226,6 +231,36 @@ namespace dxvk {
     // XS, S, M, L and XL, corresponding to 0.5 kb, 2 kb, 8 kb, 32 kb and 128 kb
     std::array<Com<d3d9::IDirect3DIndexBuffer9>, ddrawCaps::IndexBufferCount> m_ib9;
     uint32_t m_ib9_uploads[ddrawCaps::IndexBufferCount] = { };
+
+    // Dedup caches for D3D9-side state. Indexed by the post-translation D3D9
+    // state enum. Sized to comfortably cover the highest enum value in use.
+    static constexpr uint32_t MaxD3D9RenderState     = 256;
+    static constexpr uint32_t MaxD3D9SamplerState    = 16;
+    static constexpr uint32_t MaxD3D9TextureStageState = 64;
+
+    DWORD m_d3d9RsCache[MaxD3D9RenderState]                                                      = { };
+    bool  m_d3d9RsCacheValid[MaxD3D9RenderState]                                                 = { };
+
+    DWORD m_d3d9SsCache[ddrawCaps::TextureStageCount][MaxD3D9SamplerState]                       = { };
+    bool  m_d3d9SsCacheValid[ddrawCaps::TextureStageCount][MaxD3D9SamplerState]                  = { };
+
+    DWORD m_d3d9TssCache[ddrawCaps::TextureStageCount][MaxD3D9TextureStageState]                 = { };
+    bool  m_d3d9TssCacheValid[ddrawCaps::TextureStageCount][MaxD3D9TextureStageState]            = { };
+
+    d3d9::IDirect3DBaseTexture9* m_d3d9TexCache[ddrawCaps::TextureStageCount]                    = { };
+    bool                         m_d3d9TexCacheValid[ddrawCaps::TextureStageCount]               = { };
+
+    // Optional DrawPrimitive batching. Consecutive DrawPrimitive calls with the
+    // same primitive type and FVF are accumulated into a single vertex blob and
+    // emitted as one DrawPrimitiveUP call. Flushed on any state change, scene
+    // boundary, or alternative draw entry point.
+    bool                  m_batchDrawsEnabled = false;
+    bool                  m_batchActive       = false;
+    D3DPRIMITIVETYPE      m_batchPrimType     = D3DPT_TRIANGLELIST;
+    DWORD                 m_batchFvf          = 0;
+    uint32_t              m_batchFvfSize      = 0;
+    uint32_t              m_batchVertexCount  = 0;
+    std::vector<uint8_t>  m_batchVertices;
 
   };
 

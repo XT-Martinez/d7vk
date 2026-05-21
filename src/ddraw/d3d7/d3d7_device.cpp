@@ -1,11 +1,16 @@
 #include "d3d7_device.h"
 
+#include <cstring>
+
 #include "../ddraw_common_interface.h"
 
 #include "d3d7_buffer.h"
 #include "d3d7_state_block.h"
 
 #include "../ddraw7/ddraw7_surface.h"
+
+#include "../../util/util_env.h"
+#include "../../util/util_profile.h"
 
 namespace dxvk {
 
@@ -26,6 +31,13 @@ namespace dxvk {
     , m_multithread ( CreationFlags9 & D3DCREATE_MULTITHREADED )
     , m_desc ( Desc )
     , m_rt ( pSurface ) {
+    {
+      std::string value = env::getEnvVar("D7VK_BATCH_DRAWS");
+      m_batchDrawsEnabled = value == "1" || value == "true" || value == "True" || value == "TRUE";
+      if (m_batchDrawsEnabled)
+        m_batchVertices.reserve(64u * 1024u);
+    }
+
     if (m_parent != nullptr) {
       m_commonIntf = m_parent->GetCommonInterface();
     } else if (m_commonD3DDevice != nullptr) {
@@ -250,6 +262,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::BeginScene() {
+    ProfileScope profile(ProfileEvent::D3D7BeginScene);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::BeginScene");
@@ -258,6 +272,8 @@ namespace dxvk {
 
     if (unlikely(m_commonD3DDevice->IsInScene()))
       return D3DERR_SCENE_IN_SCENE;
+
+    FlushDrawBatch();
 
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->BeginScene();
 
@@ -268,6 +284,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::EndScene() {
+    ProfileScope profile(ProfileEvent::D3D7EndScene);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::EndScene");
@@ -276,6 +294,8 @@ namespace dxvk {
 
     if (unlikely(!m_commonD3DDevice->IsInScene()))
       return D3DERR_SCENE_NOT_IN_SCENE;
+
+    FlushDrawBatch();
 
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->EndScene();
 
@@ -316,6 +336,8 @@ namespace dxvk {
     HRESULT hr = rt7->GetCommonSurface()->ValidateRTUsage();
     if (unlikely(FAILED(hr)))
       return hr;
+
+    FlushDrawBatch();
 
     hr = rt7->InitializeD3D9RenderTarget();
     if (unlikely(FAILED(hr))) {
@@ -388,6 +410,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::Clear(DWORD count, D3DRECT *rects, DWORD flags, D3DCOLOR color, D3DVALUE z, DWORD stencil) {
+    ProfileScope profile(ProfileEvent::D3D7Clear);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::Clear");
@@ -395,6 +419,8 @@ namespace dxvk {
     // Fast skip
     if (unlikely(!count && rects))
       return D3D_OK;
+
+    FlushDrawBatch();
 
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->Clear(count, rects, flags, color, static_cast<float>(z), stencil);
     if (unlikely(FAILED(hr))) {
@@ -416,7 +442,12 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetTransform(D3DTRANSFORMSTATETYPE state, D3DMATRIX *matrix) {
+    ProfileScope profile(ProfileEvent::D3D7SetTransform);
+
     Logger::debug(">>> D3D7Device::SetTransform");
+
+    FlushDrawBatch();
+
     return m_commonD3DDevice->GetD3D9Device()->SetTransform(ConvertTransformState(state), matrix);
   }
 
@@ -427,6 +458,9 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D7Device::MultiplyTransform(D3DTRANSFORMSTATETYPE state, D3DMATRIX *matrix) {
     Logger::debug(">>> D3D7Device::MultiplyTransform");
+
+    FlushDrawBatch();
+
     return m_commonD3DDevice->GetD3D9Device()->MultiplyTransform(ConvertTransformState(state), matrix);
   }
 
@@ -470,6 +504,8 @@ namespace dxvk {
     if (unlikely(data->dvMinZ == 0.0f && data->dvMaxZ == 0.0f))
       data->dvMaxZ = 1.0f;
 
+    FlushDrawBatch();
+
     return m_commonD3DDevice->GetD3D9Device()->SetViewport(reinterpret_cast<d3d9::D3DVIEWPORT9*>(data));
   }
 
@@ -489,6 +525,8 @@ namespace dxvk {
 
     if (unlikely(data == nullptr))
       return DDERR_INVALIDPARAMS;
+
+    FlushDrawBatch();
 
     return m_commonD3DDevice->GetD3D9Device()->SetMaterial(reinterpret_cast<d3d9::D3DMATERIAL9*>(data));
   }
@@ -526,6 +564,8 @@ namespace dxvk {
     d3d9::D3DLIGHT9* light9 = reinterpret_cast<d3d9::D3DLIGHT9*>(data);
     m_lights[idx] = *light9;
 
+    FlushDrawBatch();
+
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->SetLight(idx, light9);
     if (unlikely(FAILED(hr)))
       return DDERR_INVALIDPARAMS;
@@ -547,6 +587,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetRenderState(D3DRENDERSTATETYPE dwRenderStateType, DWORD dwRenderState) {
+    ProfileScope profile(ProfileEvent::D3D7SetRenderState);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(str::format(">>> D3D7Device::SetRenderState: ", dwRenderStateType));
@@ -618,6 +660,8 @@ namespace dxvk {
         break;
 
       case D3DRENDERSTATE_COLORKEYENABLE: {
+        FlushDrawBatch();
+
         m_commonD3DDevice->SetColorKeyEnable(dwRenderState);
 
         const bool validColorKey = m_textures[0] != nullptr ? m_textures[0]->GetCommonSurface()->HasValidColorKey() : false;
@@ -647,12 +691,33 @@ namespace dxvk {
 
       // Used in conjunction with D3DRENDERSTATE_COLORKEYENABLE
       case D3DRENDERSTATE_COLORKEYBLENDENABLE:
+        FlushDrawBatch();
         m_commonD3DDevice->SetColorKeyBlendEnable(dwRenderState);
         return D3D_OK;
     }
 
+    // Dedup against the post-translation D3D9 state. Skip when not recording
+    // (D3D9 defers state changes into a state block while one is open, so the
+    // cached value would not reflect the live device state in that case).
+    const uint32_t rsIdx = uint32_t(State9);
+    const bool canDedupRs = !ShouldRecord() && rsIdx < MaxD3D9RenderState;
+
+    if (canDedupRs && m_d3d9RsCacheValid[rsIdx] && m_d3d9RsCache[rsIdx] == dwRenderState) {
+      Profiler::record(ProfileEvent::D3D7SetRenderStateDedup, 0u);
+      return D3D_OK;
+    }
+
+    FlushDrawBatch();
+
     // This call will never fail
-    return m_commonD3DDevice->GetD3D9Device()->SetRenderState(State9, dwRenderState);
+    HRESULT hr = m_commonD3DDevice->GetD3D9Device()->SetRenderState(State9, dwRenderState);
+
+    if (canDedupRs && likely(SUCCEEDED(hr))) {
+      m_d3d9RsCache[rsIdx]      = dwRenderState;
+      m_d3d9RsCacheValid[rsIdx] = true;
+    }
+
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::GetRenderState(D3DRENDERSTATETYPE dwRenderStateType, LPDWORD lpdwRenderState) {
@@ -738,6 +803,8 @@ namespace dxvk {
     if (unlikely(m_recorder != nullptr))
       return D3DERR_INBEGINSTATEBLOCK;
 
+    FlushDrawBatch();
+
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->BeginStateBlock();
 
     if (likely(SUCCEEDED(hr))) {
@@ -793,6 +860,12 @@ namespace dxvk {
       Logger::err(str::format("D3D7Device::ApplyStateBlock: Invalid dwBlockHandle: ", std::hex, dwBlockHandle));
       return D3DERR_INVALIDSTATEBLOCK;
     }
+
+    FlushDrawBatch();
+
+    // Applying a state block restores arbitrary D3D9 state values, so our
+    // dedup caches no longer reflect what is live on the device.
+    InvalidateDedupCaches();
 
     return stateBlockIter->second.Apply();
   }
@@ -903,6 +976,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::DrawPrimitive(D3DPRIMITIVETYPE d3dptPrimitiveType, DWORD dwVertexTypeDesc, LPVOID lpvVertices, DWORD dwVertexCount, DWORD dwFlags) {
+    ProfileScope profile(ProfileEvent::D3D7DrawPrimitive);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::DrawPrimitive");
@@ -915,6 +990,44 @@ namespace dxvk {
     if (unlikely(lpvVertices == nullptr))
       return DDERR_INVALIDPARAMS;
 
+    const uint32_t fvfSize = uint32_t(GetFVFSize(dwVertexTypeDesc));
+
+    // Triangle/line/point lists have no implicit topology across the
+    // primitive boundary, so consecutive draws with identical primitive
+    // type and FVF can be concatenated at the vertex-data level.
+    const bool batchable = m_batchDrawsEnabled
+                        && !ShouldRecord()
+                        && (d3dptPrimitiveType == D3DPT_TRIANGLELIST
+                         || d3dptPrimitiveType == D3DPT_LINELIST
+                         || d3dptPrimitiveType == D3DPT_POINTLIST);
+
+    if (batchable) {
+      if (m_batchActive
+          && m_batchPrimType == d3dptPrimitiveType
+          && m_batchFvf      == dwVertexTypeDesc
+          && m_batchFvfSize  == fvfSize) {
+        const uint8_t* src = static_cast<const uint8_t*>(lpvVertices);
+        m_batchVertices.insert(m_batchVertices.end(), src, src + size_t(dwVertexCount) * fvfSize);
+        m_batchVertexCount += dwVertexCount;
+        Profiler::record(ProfileEvent::D3D7DrawPrimitiveBatchAppend, 0u);
+        return D3D_OK;
+      }
+
+      FlushDrawBatch();
+
+      m_batchActive      = true;
+      m_batchPrimType    = d3dptPrimitiveType;
+      m_batchFvf         = dwVertexTypeDesc;
+      m_batchFvfSize     = fvfSize;
+      m_batchVertexCount = dwVertexCount;
+      const uint8_t* src = static_cast<const uint8_t*>(lpvVertices);
+      m_batchVertices.assign(src, src + size_t(dwVertexCount) * fvfSize);
+      return D3D_OK;
+    }
+
+    // Non-batchable path: flush any pending batch first, then draw immediately.
+    FlushDrawBatch();
+
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
     DDrawDirtySurfaceUpload();
@@ -924,7 +1037,7 @@ namespace dxvk {
                      d3d9::D3DPRIMITIVETYPE(d3dptPrimitiveType),
                      GetPrimitiveCount(d3dptPrimitiveType, dwVertexCount),
                      lpvVertices,
-                     GetFVFSize(dwVertexTypeDesc));
+                     fvfSize);
 
     if (unlikely(FAILED(hr))) {
       Logger::err("D3D7Device::DrawPrimitive: Failed D3D9 call to DrawPrimitiveUP");
@@ -937,6 +1050,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE d3dptPrimitiveType, DWORD dwVertexTypeDesc, LPVOID lpvVertices, DWORD dwVertexCount, LPWORD lpwIndices, DWORD dwIndexCount, DWORD dwFlags) {
+    ProfileScope profile(ProfileEvent::D3D7DrawIndexedPrimitive);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::DrawIndexedPrimitive");
@@ -948,6 +1063,8 @@ namespace dxvk {
 
     if (unlikely(lpvVertices == nullptr || lpwIndices == nullptr))
       return DDERR_INVALIDPARAMS;
+
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
@@ -1005,6 +1122,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::DrawPrimitiveStrided(D3DPRIMITIVETYPE d3dptPrimitiveType, DWORD dwVertexTypeDesc, LPD3DDRAWPRIMITIVESTRIDEDDATA lpVertexArray, DWORD dwVertexCount, DWORD dwFlags) {
+    ProfileScope profile(ProfileEvent::D3D7DrawPrimitiveStrided);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::DrawPrimitiveStrided");
@@ -1016,6 +1135,8 @@ namespace dxvk {
 
     if (unlikely(lpVertexArray == nullptr))
       return DDERR_INVALIDPARAMS;
+
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
@@ -1042,6 +1163,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::DrawIndexedPrimitiveStrided(D3DPRIMITIVETYPE d3dptPrimitiveType, DWORD dwVertexTypeDesc, LPD3DDRAWPRIMITIVESTRIDEDDATA lpVertexArray, DWORD dwVertexCount, LPWORD lpwIndices, DWORD dwIndexCount, DWORD dwFlags) {
+    ProfileScope profile(ProfileEvent::D3D7DrawIndexedPrimitiveStrided);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::DrawIndexedPrimitiveStrided");
@@ -1053,6 +1176,8 @@ namespace dxvk {
 
     if (unlikely(lpVertexArray == nullptr || lpwIndices == nullptr))
       return DDERR_INVALIDPARAMS;
+
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
@@ -1083,6 +1208,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::DrawPrimitiveVB(D3DPRIMITIVETYPE d3dptPrimitiveType, LPDIRECT3DVERTEXBUFFER7 lpd3dVertexBuffer, DWORD dwStartVertex, DWORD dwNumVertices, DWORD dwFlags) {
+    ProfileScope profile(ProfileEvent::D3D7DrawPrimitiveVB);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::DrawPrimitiveVB");
@@ -1101,6 +1228,8 @@ namespace dxvk {
       Logger::err("D3D7Device::DrawPrimitiveVB: Buffer is locked");
       return D3DERR_VERTEXBUFFERLOCKED;
     }
+
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
@@ -1124,6 +1253,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::DrawIndexedPrimitiveVB(D3DPRIMITIVETYPE d3dptPrimitiveType, LPDIRECT3DVERTEXBUFFER7 lpd3dVertexBuffer, DWORD dwStartVertex, DWORD dwNumVertices, LPWORD lpwIndices, DWORD dwIndexCount, DWORD dwFlags) {
+    ProfileScope profile(ProfileEvent::D3D7DrawIndexedPrimitiveVB);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::DrawIndexedPrimitiveVB");
@@ -1152,6 +1283,8 @@ namespace dxvk {
         return DDERR_UNSUPPORTED;
       }
     }
+
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
@@ -1221,6 +1354,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetTexture(DWORD stage, IDirectDrawSurface7 *surface) {
+    ProfileScope profile(ProfileEvent::D3D7SetTexture);
+
     D3DDeviceLock lock = LockDevice();
 
     Logger::debug(">>> D3D7Device::SetTexture");
@@ -1241,9 +1376,18 @@ namespace dxvk {
     if (surface == nullptr) {
       Logger::debug("D3D7Device::SetTexture: Unbiding D3D9 texture");
 
-      hr = device9->SetTexture(stage, nullptr);
+      if (likely(m_d3d9TexCacheValid[stage] && m_d3d9TexCache[stage] == nullptr)) {
+        Profiler::record(ProfileEvent::D3D7SetTextureDedup, 0u);
+        hr = D3D_OK;
+      } else {
+        FlushDrawBatch();
+        hr = device9->SetTexture(stage, nullptr);
+      }
 
       if (likely(SUCCEEDED(hr))) {
+        m_d3d9TexCache[stage]      = nullptr;
+        m_d3d9TexCacheValid[stage] = true;
+
         if (m_textures[stage] != nullptr) {
           Logger::debug("D3D7Device::SetTexture: Unbinding local texture");
           m_textures[stage] = nullptr;
@@ -1279,22 +1423,32 @@ namespace dxvk {
       return hr;
     }
 
-    // Don't fast skip, since color key might change
-    //if (unlikely(m_textures[stage] == surface7))
-      //return D3D_OK;
-
     d3d9::IDirect3DTexture9* tex9 = surface7->GetCommonSurface()->GetD3D9Texture();
 
     if (likely(tex9 != nullptr)) {
-      hr = device9->SetTexture(stage, tex9);
-      if (unlikely(FAILED(hr))) {
-        Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 texture");
-        return hr;
+      // Dedup against the D3D9 texture pointer. The color-key bridge updates
+      // below still run unconditionally, because color-key can change for the
+      // same underlying surface across calls.
+      if (likely(m_d3d9TexCacheValid[stage] && m_d3d9TexCache[stage] == tex9)) {
+        Profiler::record(ProfileEvent::D3D7SetTextureDedup, 0u);
+      } else {
+        FlushDrawBatch();
+        hr = device9->SetTexture(stage, tex9);
+        if (unlikely(FAILED(hr))) {
+          Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 texture");
+          return hr;
+        }
+        m_d3d9TexCache[stage]      = tex9;
+        m_d3d9TexCacheValid[stage] = true;
       }
 
       if (likely(stage == 0)) {
         const bool colorKeyEnable = m_commonD3DDevice->GetColorKeyEnable();
         const bool validColorKey = surface7->GetCommonSurface()->HasValidColorKey();
+        // Color-key state may change for the same texture between calls,
+        // so flush pending draws that used the old color-key configuration.
+        if (m_batchActive)
+          FlushDrawBatch();
         m_bridge->SetColorKeyState(colorKeyEnable && validColorKey);
         if (colorKeyEnable && validColorKey) {
           DDCOLORKEY normalizedColorKey = surface7->GetCommonSurface()->GetColorKeyNormalized();
@@ -1305,10 +1459,17 @@ namespace dxvk {
     } else {
       d3d9::IDirect3DCubeTexture9* cube9 = surface7->GetCommonSurface()->GetD3D9CubeTexture();
 
-      hr = device9->SetTexture(stage, cube9);
-      if (unlikely(FAILED(hr))) {
-        Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 cube texture");
-        return hr;
+      if (likely(m_d3d9TexCacheValid[stage] && m_d3d9TexCache[stage] == cube9)) {
+        Profiler::record(ProfileEvent::D3D7SetTextureDedup, 0u);
+      } else {
+        FlushDrawBatch();
+        hr = device9->SetTexture(stage, cube9);
+        if (unlikely(FAILED(hr))) {
+          Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 cube texture");
+          return hr;
+        }
+        m_d3d9TexCache[stage]      = cube9;
+        m_d3d9TexCacheValid[stage] = true;
       }
     }
 
@@ -1355,11 +1516,29 @@ namespace dxvk {
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
+    const bool canDedup = !ShouldRecord() && dwStage < ddrawCaps::TextureStageCount;
+
+    auto trySetSampler = [&](d3d9::D3DSAMPLERSTATETYPE ss, DWORD value) -> HRESULT {
+      const uint32_t idx = uint32_t(ss);
+      const bool dedup   = canDedup && idx < MaxD3D9SamplerState;
+      if (dedup && m_d3d9SsCacheValid[dwStage][idx] && m_d3d9SsCache[dwStage][idx] == value) {
+        Profiler::record(ProfileEvent::D3D7SetTextureStageStateDedup, 0u);
+        return D3D_OK;
+      }
+      FlushDrawBatch();
+      HRESULT hr = device9->SetSamplerState(dwStage, ss, value);
+      if (dedup && likely(SUCCEEDED(hr))) {
+        m_d3d9SsCache[dwStage][idx]      = value;
+        m_d3d9SsCacheValid[dwStage][idx] = true;
+      }
+      return hr;
+    };
+
     // In the case of D3DTSS_ADDRESS, which is exclusive to D3D7
     // and D3D6, we need to set up both D3DTSS_ADDRESSU and D3DTSS_ADDRESSV
     if (d3dTexStageStateType == D3DTSS_ADDRESS) {
-      device9->SetSamplerState(dwStage, d3d9::D3DSAMP_ADDRESSU, dwState);
-      return device9->SetSamplerState(dwStage, d3d9::D3DSAMP_ADDRESSV, dwState);
+      trySetSampler(d3d9::D3DSAMP_ADDRESSU, dwState);
+      return trySetSampler(d3d9::D3DSAMP_ADDRESSV, dwState);
     }
 
     d3d9::D3DSAMPLERSTATETYPE stateType = ConvertSamplerStateType(d3dTexStageStateType);
@@ -1370,12 +1549,24 @@ namespace dxvk {
       if (stateType == d3d9::D3DSAMP_MAGFILTER ||
           stateType == d3d9::D3DSAMP_MINFILTER || stateType == d3d9::D3DSAMP_MIPFILTER) {
         const DWORD dwState9 = DecodeD3D7TexFilterValues(d3dTexStageStateType, dwState);
-        return device9->SetSamplerState(dwStage, stateType, dwState9);
+        return trySetSampler(stateType, dwState9);
       } else {
-        return device9->SetSamplerState(dwStage, stateType, dwState);
+        return trySetSampler(stateType, dwState);
       }
     } else {
-      return device9->SetTextureStageState(dwStage, d3d9::D3DTEXTURESTAGESTATETYPE(d3dTexStageStateType), dwState);
+      const uint32_t idx = uint32_t(d3dTexStageStateType);
+      const bool dedup   = canDedup && idx < MaxD3D9TextureStageState;
+      if (dedup && m_d3d9TssCacheValid[dwStage][idx] && m_d3d9TssCache[dwStage][idx] == dwState) {
+        Profiler::record(ProfileEvent::D3D7SetTextureStageStateDedup, 0u);
+        return D3D_OK;
+      }
+      FlushDrawBatch();
+      HRESULT hr = device9->SetTextureStageState(dwStage, d3d9::D3DTEXTURESTAGESTATETYPE(d3dTexStageStateType), dwState);
+      if (dedup && likely(SUCCEEDED(hr))) {
+        m_d3d9TssCache[dwStage][idx]      = dwState;
+        m_d3d9TssCacheValid[dwStage][idx] = true;
+      }
+      return hr;
     }
   }
 
@@ -1443,6 +1634,8 @@ namespace dxvk {
 
     m_lightsStates[dwLightIndex] = bEnable;
 
+    FlushDrawBatch();
+
     return m_commonD3DDevice->GetD3D9Device()->LightEnable(dwLightIndex, bEnable);
   }
 
@@ -1461,6 +1654,7 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetClipPlane(DWORD dwIndex, D3DVALUE *pPlaneEquation) {
     Logger::debug(">>> D3D7Device::SetClipPlane");
+    FlushDrawBatch();
     return m_commonD3DDevice->GetD3D9Device()->SetClipPlane(dwIndex, pPlaneEquation);
   }
 
@@ -1528,8 +1722,44 @@ namespace dxvk {
       m_ds->GetCommonSurface()->DirtyD3D9Surface();
   }
 
+  void D3D7Device::FlushDrawBatch() {
+    if (likely(!m_batchActive))
+      return;
+
+    ProfileScope profile(ProfileEvent::D3D7DrawPrimitiveBatchFlush);
+
+    d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
+
+    DDrawDirtySurfaceUpload();
+
+    device9->SetFVF(m_batchFvf);
+    HRESULT hr = device9->DrawPrimitiveUP(
+                     d3d9::D3DPRIMITIVETYPE(m_batchPrimType),
+                     GetPrimitiveCount(m_batchPrimType, m_batchVertexCount),
+                     m_batchVertices.data(),
+                     m_batchFvfSize);
+
+    if (unlikely(FAILED(hr)))
+      Logger::err("D3D7Device::FlushDrawBatch: Failed D3D9 call to DrawPrimitiveUP");
+    else
+      UpdateSurfaceDirtyTracking(true, true, true);
+
+    m_batchActive      = false;
+    m_batchVertexCount = 0;
+    m_batchVertices.clear();
+  }
+
+  void D3D7Device::InvalidateDedupCaches() {
+    std::memset(m_d3d9RsCacheValid,  0, sizeof(m_d3d9RsCacheValid));
+    std::memset(m_d3d9SsCacheValid,  0, sizeof(m_d3d9SsCacheValid));
+    std::memset(m_d3d9TssCacheValid, 0, sizeof(m_d3d9TssCacheValid));
+    std::memset(m_d3d9TexCacheValid, 0, sizeof(m_d3d9TexCacheValid));
+  }
+
   HRESULT D3D7Device::ResetD3D9Swapchain(d3d9::D3DPRESENT_PARAMETERS* params) {
     Logger::info("D3D7Device::ResetD3D9Swapchain: Resetting the D3D9 swapchain");
+
+    FlushDrawBatch();
 
     HRESULT hr = m_bridge->ResetSwapChain(params);
     if (unlikely(FAILED(hr))) {
@@ -1577,13 +1807,14 @@ namespace dxvk {
 
   inline void D3D7Device::DDrawDirtySurfaceUpload() {
     // Render target
-    m_rt->InitializeOrUploadD3D9();
+    if (m_rt->NeedsInitializeOrUploadD3D9())
+      m_rt->InitializeOrUploadD3D9();
     // Depth stencil (if present)
-    if (likely(m_ds != nullptr))
+    if (likely(m_ds != nullptr) && m_ds->NeedsInitializeOrUploadD3D9())
       m_ds->InitializeOrUploadD3D9();
     // Bound texture(s)
     for (auto& tex : m_textures) {
-      if (tex.ptr() != nullptr)
+      if (tex.ptr() != nullptr && tex->NeedsInitializeOrUploadD3D9())
         tex->InitializeOrUploadD3D9();
     }
   }
