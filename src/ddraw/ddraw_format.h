@@ -2,6 +2,8 @@
 
 #include "ddraw_include.h"
 
+#include "../util/util_profile.h"
+
 #include <vector>
 #include <cmath>
 #include <utility>
@@ -763,38 +765,55 @@ namespace dxvk {
         const bool isDXTFormat) {
     d3d9::D3DLOCKED_RECT rect9;
     // D3DLOCK_DISCARD will get ignored for MANAGED/SYSTEMMEM, but will work on DEFAULT
-    HRESULT hr9 = surface9->LockRect(&rect9, NULL, D3DLOCK_DISCARD);
+    HRESULT hr9;
+    {
+      ProfileScope profile(ProfileEvent::TransferToD3D9SurfaceD3D9Lock);
+      hr9 = surface9->LockRect(&rect9, NULL, D3DLOCK_DISCARD);
+    }
     if (likely(SUCCEEDED(hr9))) {
       DescType desc;
       desc.dwSize = sizeof(DescType);
-      HRESULT hr = surface->Lock(NULL, &desc, DDLOCK_READONLY, NULL);
+      HRESULT hr;
+      {
+        ProfileScope profile(ProfileEvent::TransferToD3D9SurfaceDDrawLock);
+        hr = surface->Lock(NULL, &desc, DDLOCK_READONLY, NULL);
+      }
       if (likely(SUCCEEDED(hr))) {
-        // The lock pitch of a DXT surface represents its entire size, apparently
-        if (isDXTFormat) {
-          const size_t size = static_cast<size_t>(desc.lPitch);
-          memcpy(rect9.pBits, desc.lpSurface, size);
-          Logger::debug("BlitToD3D9Texture: Done blitting DXT surface");
-        } else if (desc.lPitch != rect9.Pitch) {
-          Logger::debug("BlitToD3D9Surface: Incompatible surface pitch");
+        {
+          ProfileScope profile(ProfileEvent::TransferToD3D9SurfaceCopy);
+          // The lock pitch of a DXT surface represents its entire size, apparently
+          if (isDXTFormat) {
+            const size_t size = static_cast<size_t>(desc.lPitch);
+            memcpy(rect9.pBits, desc.lpSurface, size);
+            Logger::debug("BlitToD3D9Texture: Done blitting DXT surface");
+          } else if (desc.lPitch != rect9.Pitch) {
+            Logger::debug("BlitToD3D9Surface: Incompatible surface pitch");
 
-          uint8_t* data9 = reinterpret_cast<uint8_t*>(rect9.pBits);
-          uint8_t* data7 = reinterpret_cast<uint8_t*>(desc.lpSurface);
+            uint8_t* data9 = reinterpret_cast<uint8_t*>(rect9.pBits);
+            uint8_t* data7 = reinterpret_cast<uint8_t*>(desc.lpSurface);
 
-          const size_t copyPitch = std::min<size_t>(desc.lPitch, rect9.Pitch);
-          for (uint32_t h = 0; h < desc.dwHeight; h++)
-            memcpy(&data9[h * rect9.Pitch], &data7[h * desc.lPitch], copyPitch);
+            const size_t copyPitch = std::min<size_t>(desc.lPitch, rect9.Pitch);
+            for (uint32_t h = 0; h < desc.dwHeight; h++)
+              memcpy(&data9[h * rect9.Pitch], &data7[h * desc.lPitch], copyPitch);
 
-          Logger::debug("BlitToD3D9Surface: Done blitting surface row by row");
-        } else {
-          const size_t size = static_cast<size_t>(desc.dwHeight * desc.lPitch);
-          memcpy(rect9.pBits, desc.lpSurface, size);
-          Logger::debug("BlitToD3D9Surface: Done blitting surface");
+            Logger::debug("BlitToD3D9Surface: Done blitting surface row by row");
+          } else {
+            const size_t size = static_cast<size_t>(desc.dwHeight * desc.lPitch);
+            memcpy(rect9.pBits, desc.lpSurface, size);
+            Logger::debug("BlitToD3D9Surface: Done blitting surface");
+          }
         }
-        surface->Unlock(NULL);
+        {
+          ProfileScope profile(ProfileEvent::TransferToD3D9SurfaceUnlock);
+          surface->Unlock(NULL);
+        }
       } else {
         Logger::warn("BlitToD3D9Surface: Failed to lock surface");
       }
-      surface9->UnlockRect();
+      {
+        ProfileScope profile(ProfileEvent::TransferToD3D9SurfaceUnlock);
+        surface9->UnlockRect();
+      }
     } else {
       Logger::warn("BlitToD3D9Surface: Failed to lock D3D9 surface");
     }
@@ -807,37 +826,54 @@ namespace dxvk {
         const bool isDXTFormat) {
     DescType desc;
     desc.dwSize = sizeof(DescType);
-    HRESULT hr = surface->Lock(NULL, &desc, DDLOCK_WRITEONLY, NULL);
+    HRESULT hr;
+    {
+      ProfileScope profile(ProfileEvent::TransferToDDrawSurfaceDDrawLock);
+      hr = surface->Lock(NULL, &desc, DDLOCK_WRITEONLY, NULL);
+    }
     if (likely(SUCCEEDED(hr))) {
       d3d9::D3DLOCKED_RECT rect9;
-      HRESULT hr9 = surface9->LockRect(&rect9, NULL, D3DLOCK_READONLY);
+      HRESULT hr9;
+      {
+        ProfileScope profile(ProfileEvent::TransferToDDrawSurfaceD3D9Lock);
+        hr9 = surface9->LockRect(&rect9, NULL, D3DLOCK_READONLY);
+      }
       if (likely(SUCCEEDED(hr9))) {
-        // The lock pitch of a DXT surface represents its entire size, apparently
-        if (unlikely(isDXTFormat)) {
-          const size_t size = static_cast<size_t>(desc.lPitch);
-          memcpy(desc.lpSurface, rect9.pBits, size);
-          Logger::debug("BlitToDDrawSurface: Done blitting DXT surface");
-        } else if (desc.lPitch != rect9.Pitch) {
-          Logger::debug("BlitToDDrawSurface: Incompatible surface pitch");
+        {
+          ProfileScope profile(ProfileEvent::TransferToDDrawSurfaceCopy);
+          // The lock pitch of a DXT surface represents its entire size, apparently
+          if (unlikely(isDXTFormat)) {
+            const size_t size = static_cast<size_t>(desc.lPitch);
+            memcpy(desc.lpSurface, rect9.pBits, size);
+            Logger::debug("BlitToDDrawSurface: Done blitting DXT surface");
+          } else if (desc.lPitch != rect9.Pitch) {
+            Logger::debug("BlitToDDrawSurface: Incompatible surface pitch");
 
-          uint8_t* data7 = reinterpret_cast<uint8_t*>(desc.lpSurface);
-          uint8_t* data9 = reinterpret_cast<uint8_t*>(rect9.pBits);
+            uint8_t* data7 = reinterpret_cast<uint8_t*>(desc.lpSurface);
+            uint8_t* data9 = reinterpret_cast<uint8_t*>(rect9.pBits);
 
-          const size_t copyPitch = std::min<size_t>(desc.lPitch, rect9.Pitch);
-          for (uint32_t h = 0; h < desc.dwHeight; h++)
-            memcpy(&data7[h * desc.lPitch], &data9[h * rect9.Pitch], copyPitch);
+            const size_t copyPitch = std::min<size_t>(desc.lPitch, rect9.Pitch);
+            for (uint32_t h = 0; h < desc.dwHeight; h++)
+              memcpy(&data7[h * desc.lPitch], &data9[h * rect9.Pitch], copyPitch);
 
-          Logger::debug("BlitToDDrawSurface: Done blitting surface row by row");
-        } else {
-          const size_t size = static_cast<size_t>(desc.dwHeight * desc.lPitch);
-          memcpy(desc.lpSurface, rect9.pBits, size);
-          Logger::debug("BlitToDDrawSurface: Done blitting surface");
+            Logger::debug("BlitToDDrawSurface: Done blitting surface row by row");
+          } else {
+            const size_t size = static_cast<size_t>(desc.dwHeight * desc.lPitch);
+            memcpy(desc.lpSurface, rect9.pBits, size);
+            Logger::debug("BlitToDDrawSurface: Done blitting surface");
+          }
         }
-        surface9->UnlockRect();
+        {
+          ProfileScope profile(ProfileEvent::TransferToDDrawSurfaceUnlock);
+          surface9->UnlockRect();
+        }
       } else {
         Logger::warn("BlitToDDrawSurface: Failed to lock D3D9 surface");
       }
-      surface->Unlock(NULL);
+      {
+        ProfileScope profile(ProfileEvent::TransferToDDrawSurfaceUnlock);
+        surface->Unlock(NULL);
+      }
     } else {
       Logger::warn("BlitToDDrawSurface: Failed to lock surface");
     }

@@ -11,7 +11,32 @@
 #include "../d3d3/d3d3_texture.h"
 #include "../d3d6/d3d6_texture.h"
 
+#include "../../util/util_env.h"
+#include "../../util/util_profile.h"
+
 namespace dxvk {
+
+  namespace {
+
+    bool AssumeCurrentRenderTargetLockDiscard() {
+      static bool enabled = [] {
+        std::string value = env::getEnvVar("D7VK_ASSUME_CURRENT_RT_LOCK_DISCARD");
+        return value == "1" || value == "true" || value == "True" || value == "TRUE";
+      }();
+
+      return enabled;
+    }
+
+    bool DirectCurrentRenderTargetLock() {
+      static bool enabled = [] {
+        std::string value = env::getEnvVar("D7VK_DIRECT_CURRENT_RT_LOCK");
+        return value == "1" || value == "true" || value == "True" || value == "TRUE";
+      }();
+
+      return enabled;
+    }
+
+  }
 
   uint32_t DDraw7Surface::s_surfCount = 0;
 
@@ -259,40 +284,52 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE7 lpDDSrcSurface, LPRECT lpSrcRect, DWORD dwFlags, LPDDBLTFX lpDDBltFx) {
+    ProfileScope profile(ProfileEvent::DDraw7Blt);
+
     Logger::debug("<<< DDraw7Surface::Blt: Proxy");
 
     const bool sourceIsWrappedSurface = m_commonIntf->IsWrappedSurface(lpDDSrcSurface);
-
-    // Write back any dirty surface data from bound D3D9 back buffers or
-    // depth stencils, for both the source surface and the current surface
-    if (likely(lpDDSrcSurface != nullptr && sourceIsWrappedSurface)) {
-      DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
-      sourceSurface->DownloadSurfaceData();
-    }
-    // No point in downloading the destination surface if it's going to be overwritten
-    if ((lpDDBltFx == nullptr || (dwFlags & DDBLT_COLORFILL) || (dwFlags & DDBLT_DEPTHFILL)) &&
-         m_commonSurf->IsFullSurfaceLock(lpDestRect, nullptr)) {
-      m_commonSurf->UnDirtyD3D9Surface();
-    } else {
-      DownloadSurfaceData();
-    }
 
     d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->RefreshD3D9Device();
     if (likely(d3d9Device != nullptr)) {
       const bool exclusiveMode = (m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE)
                               && !m_commonIntf->GetOptions()->ignoreExclusiveMode;
 
-      // Windowed mode presentation path
-      if (!exclusiveMode && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
-        // TODO: Handle this properly, not by uploading the RT again
+      // Windowed mode presentation path. Detect it before synchronizing the
+      // D3D9 render target back to DDraw; this path presents directly and never
+      // needs the intermediate DDraw copy.
+      if (!exclusiveMode && lpDDSrcSurface != nullptr && sourceIsWrappedSurface && m_commonSurf->IsPrimarySurface()) {
+        Profiler::record(ProfileEvent::DDraw7BltWindowedPrimary, 0u);
+
         DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
         DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
 
         if (sourceSurface == renderTarget) {
+          Profiler::record(ProfileEvent::DDraw7BltWindowedPrimaryRenderTarget, 0u);
           renderTarget->InitializeOrUploadD3D9();
           d3d9Device->Present(NULL, NULL, NULL, NULL);
           return DD_OK;
         }
+      }
+    }
+
+    // Write back any dirty surface data from bound D3D9 back buffers or
+    // depth stencils, for both the source surface and the current surface
+    if (likely(lpDDSrcSurface != nullptr && sourceIsWrappedSurface)) {
+      DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
+      if (sourceSurface->NeedsDownloadSurfaceData()) {
+        Profiler::record(ProfileEvent::DDraw7BltSourceDownload, 0u);
+        sourceSurface->DownloadSurfaceData();
+      }
+    }
+    // No point in downloading the destination surface if it's going to be overwritten
+    if ((lpDDBltFx == nullptr || (dwFlags & DDBLT_COLORFILL) || (dwFlags & DDBLT_DEPTHFILL)) &&
+         m_commonSurf->IsFullSurfaceLock(lpDestRect, nullptr)) {
+      m_commonSurf->UnDirtyD3D9Surface();
+    } else {
+      if (NeedsDownloadSurfaceData()) {
+        Profiler::record(ProfileEvent::DDraw7BltDestDownload, 0u);
+        DownloadSurfaceData();
       }
     }
 
@@ -303,9 +340,11 @@ namespace dxvk {
         Logger::warn("DDraw7Surface::Blt: Received an unwrapped source surface");
         return DDERR_UNSUPPORTED;
       }
+      ProfileScope proxyProfile(ProfileEvent::DDraw7BltProxy);
       hr = GetShadowOrProxied()->Blt(lpDestRect, lpDDSrcSurface, lpSrcRect, dwFlags, lpDDBltFx);
     } else {
       DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
+      ProfileScope proxyProfile(ProfileEvent::DDraw7BltProxy);
       hr = GetShadowOrProxied()->Blt(lpDestRect, sourceSurface->GetShadowOrProxied(), lpSrcRect, dwFlags, lpDDBltFx);
     }
 
@@ -334,16 +373,44 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::BltFast(DWORD dwX, DWORD dwY, LPDIRECTDRAWSURFACE7 lpDDSrcSurface, LPRECT lpSrcRect, DWORD dwTrans) {
+    ProfileScope profile(ProfileEvent::DDraw7BltFast);
+
     Logger::debug("<<< DDraw7Surface::BltFast: Proxy");
 
     const bool sourceIsWrappedSurface = m_commonIntf->IsWrappedSurface(lpDDSrcSurface);
+
+    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->RefreshD3D9Device();
+    if (likely(d3d9Device != nullptr)) {
+      const bool exclusiveMode = (m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE)
+                              && !m_commonIntf->GetOptions()->ignoreExclusiveMode;
+
+      // Windowed mode presentation path. Detect it before synchronizing the
+      // D3D9 render target back to DDraw; this path presents directly and never
+      // needs the intermediate DDraw copy.
+      if (!exclusiveMode && lpDDSrcSurface != nullptr && sourceIsWrappedSurface && m_commonSurf->IsPrimarySurface()) {
+        Profiler::record(ProfileEvent::DDraw7BltFastWindowedPrimary, 0u);
+
+        DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
+        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
+
+        if (sourceSurface == renderTarget) {
+          Profiler::record(ProfileEvent::DDraw7BltFastWindowedPrimaryRenderTarget, 0u);
+          renderTarget->InitializeOrUploadD3D9();
+          d3d9Device->Present(NULL, NULL, NULL, NULL);
+          return DD_OK;
+        }
+      }
+    }
 
     RECT* sourceFullSurfaceRect = nullptr;
     // Write back any dirty surface data from bound D3D9 back buffers or
     // depth stencils, for both the source surface and the current surface
     if (likely(lpDDSrcSurface != nullptr && sourceIsWrappedSurface)) {
       DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
-      sourceSurface->DownloadSurfaceData();
+      if (sourceSurface->NeedsDownloadSurfaceData()) {
+        Profiler::record(ProfileEvent::DDraw7BltFastSourceDownload, 0u);
+        sourceSurface->DownloadSurfaceData();
+      }
       sourceFullSurfaceRect = sourceSurface->GetCommonSurface()->GetFullSurfaceRect();
     }
     // No point in downloading the destination surface if it's going to be overwritten
@@ -351,25 +418,9 @@ namespace dxvk {
         m_commonSurf->IsFullSurfaceLock(lpSrcRect, sourceFullSurfaceRect)) {
       m_commonSurf->UnDirtyD3D9Surface();
     } else {
-      DownloadSurfaceData();
-    }
-
-    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->RefreshD3D9Device();
-    if (likely(d3d9Device != nullptr)) {
-      const bool exclusiveMode = (m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE)
-                              && !m_commonIntf->GetOptions()->ignoreExclusiveMode;
-
-      // Windowed mode presentation path
-      if (!exclusiveMode && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
-        // TODO: Handle this properly, not by uploading the RT again
-        DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
-        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
-
-        if (sourceSurface == renderTarget) {
-          renderTarget->InitializeOrUploadD3D9();
-          d3d9Device->Present(NULL, NULL, NULL, NULL);
-          return DD_OK;
-        }
+      if (NeedsDownloadSurfaceData()) {
+        Profiler::record(ProfileEvent::DDraw7BltFastDestDownload, 0u);
+        DownloadSurfaceData();
       }
     }
 
@@ -482,6 +533,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::Flip(LPDIRECTDRAWSURFACE7 lpDDSurfaceTargetOverride, DWORD dwFlags) {
+    ProfileScope profile(ProfileEvent::DDraw7Flip);
+
     const bool overrideIsWrappedSurface = m_commonIntf->IsWrappedSurface(lpDDSurfaceTargetOverride);
 
     Com<DDraw7Surface> overrideSurf = static_cast<DDraw7Surface*>(lpDDSurfaceTargetOverride);
@@ -770,12 +823,69 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::Lock(LPRECT lpDestRect, LPDDSURFACEDESC2 lpDDSurfaceDesc, DWORD dwFlags, HANDLE hEvent) {
+    ProfileScope profile(ProfileEvent::DDraw7Lock);
+
     Logger::debug("<<< DDraw7Surface::Lock: Proxy");
 
-    // Write back any dirty surface data from bound D3D9 back buffers or depth stencils
-    DownloadSurfaceData();
+    const bool fullSurfaceLock = m_commonSurf->IsFullSurfaceLock(lpDestRect, nullptr);
+    const bool fullWriteOnlyLock = (dwFlags & DDLOCK_WRITEONLY) && fullSurfaceLock;
 
-    return GetShadowOrProxied()->Lock(lpDestRect, lpDDSurfaceDesc, dwFlags, hEvent);
+    if (fullSurfaceLock)
+      Profiler::record(ProfileEvent::DDraw7LockFullSurface, 0u);
+    if (dwFlags & DDLOCK_WRITEONLY)
+      Profiler::record(ProfileEvent::DDraw7LockWriteOnly, 0u);
+    if (dwFlags & DDLOCK_READONLY)
+      Profiler::record(ProfileEvent::DDraw7LockReadOnly, 0u);
+    if (dwFlags & DDLOCK_DISCARDCONTENTS)
+      Profiler::record(ProfileEvent::DDraw7LockDiscard, 0u);
+
+    const bool currentRenderTarget = m_commonSurf->GetCommonD3DDevice() != nullptr
+                                  && m_commonSurf->GetCommonD3DDevice()->IsCurrentRenderTarget(m_commonSurf.ptr());
+    const bool assumeDiscard = currentRenderTarget
+                            && !(dwFlags & DDLOCK_READONLY)
+                            && AssumeCurrentRenderTargetLockDiscard();
+
+    if (currentRenderTarget)
+      Profiler::record(ProfileEvent::DDraw7LockCurrentRenderTarget, 0u);
+
+    if (currentRenderTarget && DirectCurrentRenderTargetLock()) {
+      ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetLock);
+
+      d3d9::D3DLOCKED_RECT rect9;
+      HRESULT hr9 = m_commonSurf->GetD3D9Surface()->LockRect(&rect9, nullptr,
+        (dwFlags & DDLOCK_READONLY) ? D3DLOCK_READONLY : 0);
+      if (likely(SUCCEEDED(hr9))) {
+        *lpDDSurfaceDesc = *m_commonSurf->GetDesc2();
+        lpDDSurfaceDesc->lpSurface = rect9.pBits;
+        lpDDSurfaceDesc->lPitch = rect9.Pitch;
+        m_directD3D9Lock = true;
+        return DD_OK;
+      }
+    }
+
+    // Write-only full-surface locks overwrite the old contents, so downloading
+    // dirty D3D9 data first only creates avoidable synchronization work.
+    if (fullWriteOnlyLock) {
+      Profiler::record(ProfileEvent::DDraw7LockFullWriteOnlySkip, 0u);
+    } else if (assumeDiscard) {
+      Profiler::record(ProfileEvent::DDraw7LockCurrentRenderTargetSkip, 0u);
+      m_commonSurf->UnDirtyD3D9Surface();
+    } else if (NeedsDownloadSurfaceData()) {
+      Profiler::record(ProfileEvent::DDraw7LockDownload, 0u);
+      DownloadSurfaceData();
+    }
+
+    HRESULT hr;
+
+    {
+      ProfileScope proxyProfile(ProfileEvent::DDraw7LockProxy);
+      hr = GetShadowOrProxied()->Lock(lpDestRect, lpDDSurfaceDesc, dwFlags, hEvent);
+    }
+
+    if (likely(SUCCEEDED(hr)) && fullWriteOnlyLock)
+      m_commonSurf->UnDirtyD3D9Surface();
+
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::ReleaseDC(HDC hDC) {
@@ -903,7 +1013,23 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::Unlock(LPRECT lpSurfaceData) {
+    ProfileScope profile(ProfileEvent::DDraw7Unlock);
+
     Logger::debug("<<< DDraw7Surface::Unlock: Proxy");
+
+    if (m_directD3D9Lock) {
+      ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetUnlock);
+
+      m_directD3D9Lock = false;
+      HRESULT hr = m_commonSurf->GetD3D9Surface()->UnlockRect();
+
+      if (likely(SUCCEEDED(hr))) {
+        m_commonSurf->DirtyD3D9Surface();
+        m_commonSurf->UnDirtyDDrawSurface();
+      }
+
+      return hr;
+    }
 
     HRESULT hr = GetShadowOrProxied()->Unlock(lpSurfaceData);
 
@@ -1191,6 +1317,11 @@ namespace dxvk {
       return D3D_OK;
     }
 
+    if (likely(!NeedsInitializeOrUploadD3D9()))
+      return DD_OK;
+
+    ProfileScope profile(ProfileEvent::DDraw7InitializeOrUploadD3D9);
+
     if (unlikely(!m_commonSurf->IsInitialized())) {
       if (m_commonSurf->IsTextureOrCubeMap())
         UpdateMipMapCount();
@@ -1221,6 +1352,11 @@ namespace dxvk {
     // a hack, which by some miracle works well enough in some cases, though may explode in others.
     if (likely(!m_commonIntf->GetOptions()->deviceResourceSharing))
       m_commonSurf->RefreshD3D9Device();
+
+    if (likely(!NeedsDownloadSurfaceData()))
+      return;
+
+    ProfileScope profile(ProfileEvent::DDraw7DownloadSurfaceData);
 
     if (unlikely(m_commonSurf->IsD3D9BackBuffer())) {
       Logger::debug("DDraw7Surface::DownloadSurfaceData: Surface is a bound swapchain surface");
@@ -1364,6 +1500,8 @@ namespace dxvk {
     //Fast skip
     if (!m_commonSurf->IsDDrawSurfaceDirty())
       return DD_OK;
+
+    ProfileScope profile(ProfileEvent::DDraw7UploadSurfaceData);
 
     Logger::debug(str::format("DDraw7Surface::UploadSurfaceData: Uploading nr. [[7-", m_surfCount, "]]"));
 
