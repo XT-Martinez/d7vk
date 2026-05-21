@@ -256,6 +256,14 @@ namespace dxvk {
     d3d9::IDirect3DBaseTexture9* m_d3d9TexCache[ddrawCaps::TextureStageCount]                    = { };
     bool                         m_d3d9TexCacheValid[ddrawCaps::TextureStageCount]               = { };
 
+    // Color-key bridge state cached at stage 0.
+    DDraw7Surface*        m_colorKeyLastSurface     = nullptr;
+    bool                  m_colorKeyLastEnable      = false;
+    bool                  m_colorKeyLastValid       = false;
+    DWORD                 m_colorKeyLastLow         = 0;
+    DWORD                 m_colorKeyLastHigh        = 0;
+    bool                  m_colorKeyCacheValid      = false;
+
     // Optional DrawPrimitive batching. Consecutive DrawPrimitive calls with the
     // same primitive type and FVF are accumulated into a single vertex blob and
     // emitted as one DrawPrimitiveUP call. Flushed on any state change, scene

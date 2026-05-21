@@ -691,6 +691,8 @@ namespace dxvk {
                                 normalizedColorKey.dwColorSpaceHighValue);
         }
 
+        m_colorKeyCacheValid = false;
+
         return D3D_OK;
       }
 
@@ -1411,8 +1413,10 @@ namespace dxvk {
           Logger::debug("D3D7Device::SetTexture: Unbinding local texture");
           m_textures[stage] = nullptr;
 
-          if (likely(stage == 0))
+          if (likely(stage == 0)) {
             m_bridge->SetColorKeyState(false);
+            m_colorKeyCacheValid = false;
+          }
         }
       } else {
         Logger::err("D3D7Device::SetTexture: Failed to unbind D3D9 texture");
@@ -1464,15 +1468,36 @@ namespace dxvk {
       if (likely(stage == 0)) {
         const bool colorKeyEnable = m_commonD3DDevice->GetColorKeyEnable();
         const bool validColorKey = surface7->GetCommonSurface()->HasValidColorKey();
-        // Color-key state may change for the same texture between calls,
-        // so flush pending draws that used the old color-key configuration.
-        if (m_batchActive)
-          FlushDrawBatch();
-        m_bridge->SetColorKeyState(colorKeyEnable && validColorKey);
-        if (colorKeyEnable && validColorKey) {
+        const bool active = colorKeyEnable && validColorKey;
+
+        DWORD newLow  = 0;
+        DWORD newHigh = 0;
+        if (active) {
           DDCOLORKEY normalizedColorKey = surface7->GetCommonSurface()->GetColorKeyNormalized();
-          m_bridge->SetColorKey(normalizedColorKey.dwColorSpaceLowValue,
-                                normalizedColorKey.dwColorSpaceHighValue);
+          newLow  = normalizedColorKey.dwColorSpaceLowValue;
+          newHigh = normalizedColorKey.dwColorSpaceHighValue;
+        }
+
+        const bool cacheHit = m_colorKeyCacheValid
+                           && m_colorKeyLastSurface == surface7
+                           && m_colorKeyLastEnable  == colorKeyEnable
+                           && m_colorKeyLastValid   == validColorKey
+                           && m_colorKeyLastLow     == newLow
+                           && m_colorKeyLastHigh    == newHigh;
+
+        if (!cacheHit) {
+          if (m_batchActive)
+            FlushDrawBatch();
+          m_bridge->SetColorKeyState(active);
+          if (active)
+            m_bridge->SetColorKey(newLow, newHigh);
+
+          m_colorKeyLastSurface = surface7;
+          m_colorKeyLastEnable  = colorKeyEnable;
+          m_colorKeyLastValid   = validColorKey;
+          m_colorKeyLastLow     = newLow;
+          m_colorKeyLastHigh    = newHigh;
+          m_colorKeyCacheValid  = true;
         }
       }
     } else {
@@ -1773,6 +1798,7 @@ namespace dxvk {
     std::memset(m_d3d9SsCacheValid,  0, sizeof(m_d3d9SsCacheValid));
     std::memset(m_d3d9TssCacheValid, 0, sizeof(m_d3d9TssCacheValid));
     std::memset(m_d3d9TexCacheValid, 0, sizeof(m_d3d9TexCacheValid));
+    m_colorKeyCacheValid = false;
   }
 
   HRESULT D3D7Device::ResetD3D9Swapchain(d3d9::D3DPRESENT_PARAMETERS* params) {
