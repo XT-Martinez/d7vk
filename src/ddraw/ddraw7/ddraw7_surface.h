@@ -9,6 +9,7 @@
 #include "ddraw7_interface.h"
 
 #include <array>
+#include <memory>
 #include <unordered_map>
 
 namespace dxvk {
@@ -233,6 +234,16 @@ namespace dxvk {
     Com<DDraw7Surface>                  m_depthStencil;
 
     bool                                m_directD3D9Lock = false;
+
+    // When D7VK_RT_LOCK_SCRATCH=1, current-RT direct locks return a
+    // scratch CPU buffer and Unlock discards the writes. Skips D9
+    // LockRect's mandatory copyImageToBuffer + WaitForResource — the
+    // single biggest cost on uaRO's login screen (~1.4 ms/frame). Safe
+    // only when the game neither reads the lock pixels nor relies on
+    // its writes landing on the RT, which is true of uaRO at login.
+    std::unique_ptr<uint8_t[]>          m_scratchLockBuffer;
+    uint32_t                            m_scratchLockSize     = 0;
+    bool                                m_scratchLockActive   = false;
 
     // These are attached surfaces, which are typically mips or other types of generated
     // surfaces, which need to exist for the entire lifecycle of their parent surface.

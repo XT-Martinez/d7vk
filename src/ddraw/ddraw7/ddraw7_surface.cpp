@@ -36,6 +36,15 @@ namespace dxvk {
       return enabled;
     }
 
+    bool ScratchCurrentRenderTargetLock() {
+      static bool enabled = [] {
+        std::string value = env::getEnvVar("D7VK_RT_LOCK_SCRATCH");
+        return value == "1" || value == "true" || value == "True" || value == "TRUE";
+      }();
+
+      return enabled;
+    }
+
   }
 
   uint32_t DDraw7Surface::s_surfCount = 0;
@@ -851,6 +860,29 @@ namespace dxvk {
     if (currentRenderTarget && DirectCurrentRenderTargetLock()) {
       ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetLock);
 
+      // Scratch-buffer path (D7VK_RT_LOCK_SCRATCH=1). Hand the game a
+      // CPU scratch buffer and discard its writes at Unlock. Skips D9's
+      // mandatory copyImageToBuffer + WaitForResource on RT LockRect —
+      // the single biggest cost on uaRO's login screen, eliminating
+      // ~1.4 ms/frame of GPU fence wait. Visually correct only when the
+      // game neither reads the lock's pixels nor relies on its writes
+      // landing on the GPU RT.
+      if (unlikely(ScratchCurrentRenderTargetLock())) {
+        const DDSURFACEDESC2* desc = m_commonSurf->GetDesc2();
+        const uint32_t pitch  = (desc->dwWidth ? desc->dwWidth : 1u) * 4u;
+        const uint32_t height = desc->dwHeight ? desc->dwHeight : 1u;
+        const uint32_t size   = pitch * height;
+        if (m_scratchLockSize < size) {
+          m_scratchLockBuffer = std::make_unique<uint8_t[]>(size);
+          m_scratchLockSize   = size;
+        }
+        *lpDDSurfaceDesc = *desc;
+        lpDDSurfaceDesc->lpSurface = m_scratchLockBuffer.get();
+        lpDDSurfaceDesc->lPitch    = pitch;
+        m_scratchLockActive = true;
+        return DD_OK;
+      }
+
       d3d9::D3DLOCKED_RECT rect9;
       HRESULT hr9 = m_commonSurf->GetD3D9Surface()->LockRect(&rect9, nullptr,
         (dwFlags & DDLOCK_READONLY) ? D3DLOCK_READONLY : 0);
@@ -1016,6 +1048,12 @@ namespace dxvk {
     ProfileScope profile(ProfileEvent::DDraw7Unlock);
 
     Logger::debug("<<< DDraw7Surface::Unlock: Proxy");
+
+    if (unlikely(m_scratchLockActive)) {
+      ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetUnlock);
+      m_scratchLockActive = false;
+      return DD_OK;
+    }
 
     if (m_directD3D9Lock) {
       ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetUnlock);
