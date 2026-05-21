@@ -116,6 +116,10 @@ namespace dxvk {
     return m_device->SetLegacyLightsState(legacyLightsState);
   }
 
+  DxvkDevice* DxvkD3D8Bridge::GetDXVKDevice() const {
+    return m_device->GetDXVKDevice().ptr();
+  }
+
   DxvkD3D8InterfaceBridge::DxvkD3D8InterfaceBridge(D3D9InterfaceEx* pObject)
     : m_interface(pObject) {
   }

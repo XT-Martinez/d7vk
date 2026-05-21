@@ -39,13 +39,6 @@ namespace dxvk {
         m_batchVertices.reserve(64u * 1024u);
     }
 
-    {
-      std::string value = env::getEnvVar("D7VK_DIRECT_VULKAN");
-      const bool directVulkan = value == "1" || value == "true" || value == "True" || value == "TRUE";
-      if (directVulkan)
-        m_directRenderer = std::make_unique<D3D7DirectRenderer>(this);
-    }
-
     if (m_parent != nullptr) {
       m_commonIntf = m_parent->GetCommonInterface();
     } else if (m_commonD3DDevice != nullptr) {
@@ -96,6 +89,15 @@ namespace dxvk {
     m_commonD3DDevice->SetD3D7Device(this);
 
     m_textures.fill(nullptr);
+
+    // Construct the direct-Vulkan renderer after the bridge is live, since
+    // its ctor pulls the DxvkDevice through the bridge.
+    {
+      std::string value = env::getEnvVar("D7VK_DIRECT_VULKAN");
+      const bool directVulkan = value == "1" || value == "true" || value == "True" || value == "TRUE";
+      if (directVulkan)
+        m_directRenderer = std::make_unique<D3D7DirectRenderer>(this);
+    }
 
     m_deviceCount = ++s_deviceCount;
 

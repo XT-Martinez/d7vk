@@ -153,6 +153,10 @@ namespace dxvk {
       return m_commonD3DDevice.ptr();
     }
 
+    DxvkD3D8Bridge* GetBridge() const {
+      return m_bridge.ptr();
+    }
+
     D3DDeviceLock LockDevice() {
       return m_multithread.AcquireLock();
     }

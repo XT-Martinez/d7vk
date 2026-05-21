@@ -123,6 +123,7 @@ __CRT_UUID_DECL(IDxvkD3D8InterfaceBridge, 0xD3D9D3D8, 0xA407, 0x773E, 0x18, 0xE9
 
 namespace dxvk {
 
+  class DxvkDevice;
   class D3D9DeviceEx;
   class D3D9InterfaceEx;
 
@@ -157,6 +158,12 @@ namespace dxvk {
     HRESULT SetColorKey(DWORD colorKeyLow, DWORD colorKeyHigh);
 
     HRESULT SetLegacyLightsState(bool legacyLightsState);
+
+    // Internal D7VK direct-path accessor: returns a non-owning pointer to
+    // the shared DxvkDevice that backs this D3D9 device. The Rc is held by
+    // D3D9DeviceEx; the pointer is valid for the lifetime of this bridge.
+    // Not part of the IDxvkD3D8Bridge COM ABI.
+    DxvkDevice* GetDXVKDevice() const;
 
   private:
 
