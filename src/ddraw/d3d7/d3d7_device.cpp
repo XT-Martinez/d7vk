@@ -1031,7 +1031,6 @@ namespace dxvk {
 
     D3DDeviceLock lock = LockDevice();
 
-    Logger::debug(">>> D3D7Device::DrawPrimitive");
 
     RefreshLastUsedDevice();
 
@@ -1043,34 +1042,53 @@ namespace dxvk {
 
     const uint32_t fvfSize = uint32_t(GetFVFSize(dwVertexTypeDesc));
 
-    // Triangle/line/point lists have no implicit topology across the
-    // primitive boundary, so consecutive draws with identical primitive
-    // type and FVF can be concatenated at the vertex-data level.
+    // Map source primitive type to its batched equivalent. Triangle strips
+    // and fans are expanded to triangle-list form during append so they
+    // coalesce with tri-list batches and with each other.
+    D3DPRIMITIVETYPE batchedPrim;
+    switch (d3dptPrimitiveType) {
+      case D3DPT_TRIANGLELIST:
+      case D3DPT_TRIANGLESTRIP:
+      case D3DPT_TRIANGLEFAN:
+        batchedPrim = D3DPT_TRIANGLELIST; break;
+      case D3DPT_LINELIST:
+        batchedPrim = D3DPT_LINELIST;     break;
+      case D3DPT_POINTLIST:
+        batchedPrim = D3DPT_POINTLIST;    break;
+      default:
+        batchedPrim = d3dptPrimitiveType; break;
+    }
+
     const bool batchable = !ShouldRecord()
-                        && (d3dptPrimitiveType == D3DPT_TRIANGLELIST
-                         || d3dptPrimitiveType == D3DPT_LINELIST
-                         || d3dptPrimitiveType == D3DPT_POINTLIST);
+                        && (batchedPrim == D3DPT_TRIANGLELIST
+                         || batchedPrim == D3DPT_LINELIST
+                         || batchedPrim == D3DPT_POINTLIST);
 
     if (batchable) {
+      // Strip/fan with < 3 vertices produces zero triangles; do nothing
+      // rather than disturbing batch state.
+      if ((d3dptPrimitiveType == D3DPT_TRIANGLESTRIP || d3dptPrimitiveType == D3DPT_TRIANGLEFAN)
+          && dwVertexCount < 3u) {
+        return D3D_OK;
+      }
+
       if (m_batchActive
-          && m_batchPrimType == d3dptPrimitiveType
+          && m_batchPrimType == batchedPrim
           && m_batchFvf      == dwVertexTypeDesc
           && m_batchFvfSize  == fvfSize) {
-        const uint8_t* src = static_cast<const uint8_t*>(lpvVertices);
-        m_batchVertices.insert(m_batchVertices.end(), src, src + size_t(dwVertexCount) * fvfSize);
-        m_batchVertexCount += dwVertexCount;
+        AppendVerticesToBatch(d3dptPrimitiveType, lpvVertices, dwVertexCount, fvfSize);
         return D3D_OK;
       }
 
       FlushDrawBatch();
 
       m_batchActive      = true;
-      m_batchPrimType    = d3dptPrimitiveType;
+      m_batchPrimType    = batchedPrim;
       m_batchFvf         = dwVertexTypeDesc;
       m_batchFvfSize     = fvfSize;
-      m_batchVertexCount = dwVertexCount;
-      const uint8_t* src = static_cast<const uint8_t*>(lpvVertices);
-      m_batchVertices.assign(src, src + size_t(dwVertexCount) * fvfSize);
+      m_batchVertexCount = 0;
+      m_batchVertices.clear();
+      AppendVerticesToBatch(d3dptPrimitiveType, lpvVertices, dwVertexCount, fvfSize);
       return D3D_OK;
     }
 
@@ -1102,7 +1120,6 @@ namespace dxvk {
 
     D3DDeviceLock lock = LockDevice();
 
-    Logger::debug(">>> D3D7Device::DrawIndexedPrimitive");
 
     RefreshLastUsedDevice();
 
@@ -1173,7 +1190,6 @@ namespace dxvk {
 
     D3DDeviceLock lock = LockDevice();
 
-    Logger::debug(">>> D3D7Device::DrawPrimitiveStrided");
 
     RefreshLastUsedDevice();
 
@@ -1213,7 +1229,6 @@ namespace dxvk {
 
     D3DDeviceLock lock = LockDevice();
 
-    Logger::debug(">>> D3D7Device::DrawIndexedPrimitiveStrided");
 
     RefreshLastUsedDevice();
 
@@ -1257,7 +1272,6 @@ namespace dxvk {
 
     D3DDeviceLock lock = LockDevice();
 
-    Logger::debug(">>> D3D7Device::DrawPrimitiveVB");
 
     RefreshLastUsedDevice();
 
@@ -1301,7 +1315,6 @@ namespace dxvk {
 
     D3DDeviceLock lock = LockDevice();
 
-    Logger::debug(">>> D3D7Device::DrawIndexedPrimitiveVB");
 
     RefreshLastUsedDevice();
 
@@ -1840,6 +1853,70 @@ namespace dxvk {
 
     if (likely(dirtyDepthStencil && m_ds != nullptr))
       m_ds->GetCommonSurface()->DirtyD3D9Surface();
+  }
+
+  void D3D7Device::AppendVerticesToBatch(D3DPRIMITIVETYPE sourcePrim, const void* vertices, uint32_t vertexCount, uint32_t fvfSize) {
+    const uint8_t* src = static_cast<const uint8_t*>(vertices);
+
+    switch (sourcePrim) {
+      case D3DPT_TRIANGLELIST:
+      case D3DPT_LINELIST:
+      case D3DPT_POINTLIST: {
+        const size_t bytes   = size_t(vertexCount) * fvfSize;
+        const size_t oldSize = m_batchVertices.size();
+        m_batchVertices.resize(oldSize + bytes);
+        std::memcpy(m_batchVertices.data() + oldSize, src, bytes);
+        m_batchVertexCount += vertexCount;
+        return;
+      }
+
+      case D3DPT_TRIANGLESTRIP: {
+        if (unlikely(vertexCount < 3u)) return;
+        const uint32_t triCount = vertexCount - 2u;
+        const size_t   bytes    = size_t(triCount) * 3u * fvfSize;
+        const size_t   oldSize  = m_batchVertices.size();
+        m_batchVertices.resize(oldSize + bytes);
+        uint8_t* dst = m_batchVertices.data() + oldSize;
+
+        // D3D triangle strip: for triangle i in 0..triCount-1, rendered
+        // triangle is (v[i], v[i+1], v[i+2]) when i is even and
+        // (v[i+1], v[i], v[i+2]) when i is odd, preserving consistent
+        // rasterizer winding across the strip.
+        for (uint32_t i = 0; i < triCount; i++) {
+          const uint32_t a = (i & 1u) ? (i + 1u) : i;
+          const uint32_t b = (i & 1u) ? i        : (i + 1u);
+          const uint32_t c = i + 2u;
+          std::memcpy(dst,                src + size_t(a) * fvfSize, fvfSize);
+          std::memcpy(dst + fvfSize,      src + size_t(b) * fvfSize, fvfSize);
+          std::memcpy(dst + 2u * fvfSize, src + size_t(c) * fvfSize, fvfSize);
+          dst += 3u * size_t(fvfSize);
+        }
+        m_batchVertexCount += triCount * 3u;
+        return;
+      }
+
+      case D3DPT_TRIANGLEFAN: {
+        if (unlikely(vertexCount < 3u)) return;
+        const uint32_t triCount = vertexCount - 2u;
+        const size_t   bytes    = size_t(triCount) * 3u * fvfSize;
+        const size_t   oldSize  = m_batchVertices.size();
+        m_batchVertices.resize(oldSize + bytes);
+        uint8_t* dst = m_batchVertices.data() + oldSize;
+
+        // D3D triangle fan: anchor vertex v[0], rendered triangle i is
+        // (v[0], v[i+1], v[i+2]).
+        for (uint32_t i = 0; i < triCount; i++) {
+          std::memcpy(dst,                src,                                fvfSize);
+          std::memcpy(dst + fvfSize,      src + size_t(i + 1u) * fvfSize,     fvfSize);
+          std::memcpy(dst + 2u * fvfSize, src + size_t(i + 2u) * fvfSize,     fvfSize);
+          dst += 3u * size_t(fvfSize);
+        }
+        m_batchVertexCount += triCount * 3u;
+        return;
+      }
+
+      default: return;
+    }
   }
 
   void D3D7Device::FlushDrawBatch() {

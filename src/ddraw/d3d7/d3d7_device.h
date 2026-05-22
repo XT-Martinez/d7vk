@@ -202,6 +202,13 @@ namespace dxvk {
 
     void FlushDrawBatch();
 
+    // Append vertices into the active batch, expanding triangle strips and
+    // fans into triangle-list form so they can coalesce with regular tri-list
+    // draws. Caller must have already started the batch with effective
+    // primitive type D3DPT_TRIANGLELIST (or D3DPT_LINELIST / D3DPT_POINTLIST
+    // for the line/point cases, which pass through unchanged).
+    void AppendVerticesToBatch(D3DPRIMITIVETYPE sourcePrim, const void* vertices, uint32_t vertexCount, uint32_t fvfSize);
+
     inline void RefreshLastUsedDevice() {
       if (unlikely(m_commonIntf->GetCommonD3DDevice() != m_commonD3DDevice.ptr()))
         m_commonIntf->SetCommonD3DDevice(m_commonD3DDevice.ptr());
