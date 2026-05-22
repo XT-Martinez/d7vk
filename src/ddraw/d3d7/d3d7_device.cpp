@@ -1398,10 +1398,43 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetTexture(DWORD stage, IDirectDrawSurface7 *surface) {
+    // Top-level fast path. RO rebinds the same texture every draw (~one
+    // SetTexture per 2 draws), so the same (stage, surface) tuple comes
+    // back over and over. If the surface is the one we already have bound,
+    // is initialized, has no pending DDraw-side dirty data to upload, and
+    // (at stage 0) the color-key configuration hasn't changed, the slow
+    // path's work is a no-op anyway — bail before LockDevice, the wrapper
+    // checks, InitializeOrUploadD3D9, GetD3D9Texture, and the dedup branch.
+    if (likely(stage < ddrawCaps::TextureStageCount
+            && surface != nullptr
+            && m_textures[stage].ptr() == surface
+            && !ShouldRecord())) {
+      DDraw7Surface* surface7 = static_cast<DDraw7Surface*>(surface);
+      DDrawCommonSurface* commonSurf = surface7->GetCommonSurface();
+      if (likely(commonSurf->IsInitialized() && !commonSurf->IsDDrawSurfaceDirty())) {
+        if (stage != 0)
+          return D3D_OK;
+        // Stage 0: must also match the color-key configuration captured by
+        // the slow path. The game can mutate the surface's color-key value
+        // independently of SetTexture, so when CK is active we still have to
+        // compare the normalized Low/High to detect that.
+        if (likely(m_colorKeyCacheValid && m_colorKeyLastSurface == surface7)) {
+          const bool colorKeyEnable = m_commonD3DDevice->GetColorKeyEnable();
+          const bool validColorKey  = commonSurf->HasValidColorKey();
+          if (likely(m_colorKeyLastEnable == colorKeyEnable
+                  && m_colorKeyLastValid  == validColorKey)) {
+            if (!(colorKeyEnable && validColorKey))
+              return D3D_OK;
+            DDCOLORKEY ck = commonSurf->GetColorKeyNormalized();
+            if (likely(m_colorKeyLastLow  == ck.dwColorSpaceLowValue
+                    && m_colorKeyLastHigh == ck.dwColorSpaceHighValue))
+              return D3D_OK;
+          }
+        }
+      }
+    }
 
     D3DDeviceLock lock = LockDevice();
-
-    Logger::debug(">>> D3D7Device::SetTexture");
 
     if (unlikely(stage >= ddrawCaps::TextureStageCount)) {
       Logger::err(str::format("D3D7Device::SetTexture: Invalid texture stage: ", stage));
