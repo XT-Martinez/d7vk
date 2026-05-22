@@ -264,11 +264,10 @@ namespace dxvk {
     DWORD                 m_colorKeyLastHigh        = 0;
     bool                  m_colorKeyCacheValid      = false;
 
-    // Optional DrawPrimitive batching. Consecutive DrawPrimitive calls with the
-    // same primitive type and FVF are accumulated into a single vertex blob and
-    // emitted as one DrawPrimitiveUP call. Flushed on any state change, scene
-    // boundary, or alternative draw entry point.
-    bool                  m_batchDrawsEnabled = false;
+    // DrawPrimitive batching. Consecutive DrawPrimitive calls with the
+    // same primitive type and FVF are accumulated into a single vertex blob
+    // and emitted as one DrawPrimitiveUP call. Flushed on any state change,
+    // scene boundary, or alternative draw entry point.
     bool                  m_batchActive       = false;
     D3DPRIMITIVETYPE      m_batchPrimType     = D3DPT_TRIANGLELIST;
     DWORD                 m_batchFvf          = 0;
@@ -276,8 +275,8 @@ namespace dxvk {
     uint32_t              m_batchVertexCount  = 0;
     std::vector<uint8_t>  m_batchVertices;
 
-    // Optional D3D7 -> Vulkan direct path. Allocated only when D7VK_DIRECT_VULKAN
-    // is set. Phase 0 skeleton: object exists but no entry points route to it yet.
+    // D3D7 -> Vulkan direct path. Currently routes Clear's color portion
+    // through DxvkContext, bypassing D3D9's wrapper.
     std::unique_ptr<D3D7DirectRenderer> m_directRenderer;
 
   };
