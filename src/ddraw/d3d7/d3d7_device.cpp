@@ -12,6 +12,40 @@
 
 namespace dxvk {
 
+  namespace {
+
+    // States whose slow-path handler has effects beyond a single D3D9
+    // SetRenderState call (translation tables, side effects on bridge /
+    // common-device caches, etc.). Excluded from the input-dedup fast path
+    // so the slow path always runs and we don't have to update the d3d7
+    // cache at every early-return site.
+    inline bool IsSlowPathD3D7Rs(D3DRENDERSTATETYPE t) {
+      switch (t) {
+        case D3DRENDERSTATE_ANTIALIAS:
+        case D3DRENDERSTATE_TEXTUREPERSPECTIVE:
+        case D3DRENDERSTATE_LINEPATTERN:
+        case D3DRENDERSTATE_ZVISIBLE:
+        case D3DRENDERSTATE_STIPPLEDALPHA:
+        case D3DRENDERSTATE_EDGEANTIALIAS:
+        case D3DRENDERSTATE_COLORKEYENABLE:
+        case D3DRENDERSTATE_ZBIAS:
+        case D3DRENDERSTATE_EXTENTS:
+        case D3DRENDERSTATE_COLORKEYBLENDENABLE:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    // D3DTSS_ADDRESS sets both U and V sampler addresses; an input-keyed
+    // dedup against just (stage, ADDRESS) would miss intervening calls to
+    // ADDRESSU / ADDRESSV. Excluded from the fast path.
+    inline bool IsSlowPathD3D7Tss(D3DTEXTURESTAGESTATETYPE t) {
+      return t == D3DTSS_ADDRESS;
+    }
+
+  }
+
   uint32_t D3D7Device::s_deviceCount = 0;
 
   D3D7Device::D3D7Device(
@@ -587,10 +621,22 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetRenderState(D3DRENDERSTATETYPE dwRenderStateType, DWORD dwRenderState) {
+    // Top-level input dedup. Catches the common case of the game re-emitting
+    // identical (type, value) pairs across draws — about 90% of the ~2k
+    // SetRenderState calls per frame in Ragnarok Online. Bails out before
+    // LockDevice, the validity check, the translation switch, and Logger.
+    {
+      const uint32_t d7Idx = uint32_t(dwRenderStateType);
+      if (likely(d7Idx < MaxD3D7RenderState
+              && !IsSlowPathD3D7Rs(dwRenderStateType)
+              && m_d3d7RsCacheValid[d7Idx]
+              && m_d3d7RsCache[d7Idx] == dwRenderState
+              && !ShouldRecord())) {
+        return D3D_OK;
+      }
+    }
 
     D3DDeviceLock lock = LockDevice();
-
-    Logger::debug(str::format(">>> D3D7Device::SetRenderState: ", dwRenderStateType));
 
     // As opposed to D3D8/9, D3D7 actually validates and
     // errors out in case of unknown/invalid render states
@@ -715,6 +761,12 @@ namespace dxvk {
     if (canDedupRs && likely(SUCCEEDED(hr))) {
       m_d3d9RsCache[rsIdx]      = dwRenderState;
       m_d3d9RsCacheValid[rsIdx] = true;
+
+      const uint32_t d7Idx = uint32_t(dwRenderStateType);
+      if (likely(d7Idx < MaxD3D7RenderState && !IsSlowPathD3D7Rs(dwRenderStateType))) {
+        m_d3d7RsCache[d7Idx]      = dwRenderState;
+        m_d3d7RsCacheValid[d7Idx] = true;
+      }
     }
 
     return hr;
@@ -1523,7 +1575,21 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetTextureStageState(DWORD dwStage, D3DTEXTURESTAGESTATETYPE d3dTexStageStateType, DWORD dwState) {
-    Logger::debug(">>> D3D7Device::SetTextureStageState");
+    // Top-level input dedup. Catches the common case of the game re-emitting
+    // identical (stage, type, value) tuples per draw — ~90% of the ~8.8k TSS
+    // calls per frame in Ragnarok Online. Bails out before the device fetch,
+    // the lambda construction, the translation, and Logger.
+    {
+      const uint32_t d7Idx = uint32_t(d3dTexStageStateType);
+      if (likely(dwStage < ddrawCaps::TextureStageCount
+              && d7Idx < MaxD3D7TextureStageState
+              && !IsSlowPathD3D7Tss(d3dTexStageStateType)
+              && m_d3d7TssCacheValid[dwStage][d7Idx]
+              && m_d3d7TssCache[dwStage][d7Idx] == dwState
+              && !ShouldRecord())) {
+        return D3D_OK;
+      }
+    }
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
@@ -1545,13 +1611,15 @@ namespace dxvk {
     };
 
     // In the case of D3DTSS_ADDRESS, which is exclusive to D3D7
-    // and D3D6, we need to set up both D3DTSS_ADDRESSU and D3DTSS_ADDRESSV
+    // and D3D6, we need to set up both D3DTSS_ADDRESSU and D3DTSS_ADDRESSV.
+    // Excluded from input dedup (see IsSlowPathD3D7Tss).
     if (d3dTexStageStateType == D3DTSS_ADDRESS) {
       trySetSampler(d3d9::D3DSAMP_ADDRESSU, dwState);
       return trySetSampler(d3d9::D3DSAMP_ADDRESSV, dwState);
     }
 
     d3d9::D3DSAMPLERSTATETYPE stateType = ConvertSamplerStateType(d3dTexStageStateType);
+    HRESULT hr;
 
     // If the type has been remapped to a sampler state type
     if (stateType != -1u) {
@@ -1559,24 +1627,34 @@ namespace dxvk {
       if (stateType == d3d9::D3DSAMP_MAGFILTER ||
           stateType == d3d9::D3DSAMP_MINFILTER || stateType == d3d9::D3DSAMP_MIPFILTER) {
         const DWORD dwState9 = DecodeD3D7TexFilterValues(d3dTexStageStateType, dwState);
-        return trySetSampler(stateType, dwState9);
+        hr = trySetSampler(stateType, dwState9);
       } else {
-        return trySetSampler(stateType, dwState);
+        hr = trySetSampler(stateType, dwState);
       }
     } else {
       const uint32_t idx = uint32_t(d3dTexStageStateType);
       const bool dedup   = canDedup && idx < MaxD3D9TextureStageState;
       if (dedup && m_d3d9TssCacheValid[dwStage][idx] && m_d3d9TssCache[dwStage][idx] == dwState) {
-        return D3D_OK;
+        hr = D3D_OK;
+      } else {
+        FlushDrawBatch();
+        hr = device9->SetTextureStageState(dwStage, d3d9::D3DTEXTURESTAGESTATETYPE(d3dTexStageStateType), dwState);
+        if (dedup && likely(SUCCEEDED(hr))) {
+          m_d3d9TssCache[dwStage][idx]      = dwState;
+          m_d3d9TssCacheValid[dwStage][idx] = true;
+        }
       }
-      FlushDrawBatch();
-      HRESULT hr = device9->SetTextureStageState(dwStage, d3d9::D3DTEXTURESTAGESTATETYPE(d3dTexStageStateType), dwState);
-      if (dedup && likely(SUCCEEDED(hr))) {
-        m_d3d9TssCache[dwStage][idx]      = dwState;
-        m_d3d9TssCacheValid[dwStage][idx] = true;
-      }
-      return hr;
     }
+
+    // Populate d3d7 input cache so subsequent identical calls hit the fast path.
+    if (canDedup && likely(SUCCEEDED(hr))) {
+      const uint32_t d7Idx = uint32_t(d3dTexStageStateType);
+      if (likely(d7Idx < MaxD3D7TextureStageState)) {
+        m_d3d7TssCache[dwStage][d7Idx]      = dwState;
+        m_d3d7TssCacheValid[dwStage][d7Idx] = true;
+      }
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::ValidateDevice(LPDWORD lpdwPasses) {
@@ -1762,6 +1840,8 @@ namespace dxvk {
     std::memset(m_d3d9SsCacheValid,  0, sizeof(m_d3d9SsCacheValid));
     std::memset(m_d3d9TssCacheValid, 0, sizeof(m_d3d9TssCacheValid));
     std::memset(m_d3d9TexCacheValid, 0, sizeof(m_d3d9TexCacheValid));
+    std::memset(m_d3d7RsCacheValid,  0, sizeof(m_d3d7RsCacheValid));
+    std::memset(m_d3d7TssCacheValid, 0, sizeof(m_d3d7TssCacheValid));
     m_colorKeyCacheValid = false;
   }
 

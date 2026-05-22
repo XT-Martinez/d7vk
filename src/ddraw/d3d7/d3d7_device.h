@@ -253,6 +253,23 @@ namespace dxvk {
     DWORD m_d3d9TssCache[ddrawCaps::TextureStageCount][MaxD3D9TextureStageState]                 = { };
     bool  m_d3d9TssCacheValid[ddrawCaps::TextureStageCount][MaxD3D9TextureStageState]            = { };
 
+    // D3D7-input dedup caches. Hot-path optimization: when the game re-emits
+    // the same (type, value) pair (which RO does ~90% of the time across
+    // ~11k state-setter calls per frame), we short-circuit at the very top of
+    // SetRenderState / SetTextureStageState — no translation, no LockDevice,
+    // no Logger::debug, no lambda capture, just bounds + valid + compare.
+    // Keyed on the raw D3D7 input; only populated for types that the slow
+    // path treats as 1:1 translations (no side effects beyond a single D3D9
+    // SetRenderState / SetTextureStageState / SetSamplerState call).
+    static constexpr uint32_t MaxD3D7RenderState       = 256;
+    static constexpr uint32_t MaxD3D7TextureStageState = 32;
+
+    DWORD m_d3d7RsCache[MaxD3D7RenderState]                                                      = { };
+    bool  m_d3d7RsCacheValid[MaxD3D7RenderState]                                                 = { };
+
+    DWORD m_d3d7TssCache[ddrawCaps::TextureStageCount][MaxD3D7TextureStageState]                 = { };
+    bool  m_d3d7TssCacheValid[ddrawCaps::TextureStageCount][MaxD3D7TextureStageState]            = { };
+
     d3d9::IDirect3DBaseTexture9* m_d3d9TexCache[ddrawCaps::TextureStageCount]                    = { };
     bool                         m_d3d9TexCacheValid[ddrawCaps::TextureStageCount]               = { };
 
