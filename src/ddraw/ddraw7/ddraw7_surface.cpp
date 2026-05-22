@@ -11,41 +11,9 @@
 #include "../d3d3/d3d3_texture.h"
 #include "../d3d6/d3d6_texture.h"
 
-#include "../../util/util_env.h"
 #include "../../util/util_profile.h"
 
 namespace dxvk {
-
-  namespace {
-
-    bool AssumeCurrentRenderTargetLockDiscard() {
-      static bool enabled = [] {
-        std::string value = env::getEnvVar("D7VK_ASSUME_CURRENT_RT_LOCK_DISCARD");
-        return value == "1" || value == "true" || value == "True" || value == "TRUE";
-      }();
-
-      return enabled;
-    }
-
-    bool DirectCurrentRenderTargetLock() {
-      static bool enabled = [] {
-        std::string value = env::getEnvVar("D7VK_DIRECT_CURRENT_RT_LOCK");
-        return value == "1" || value == "true" || value == "True" || value == "TRUE";
-      }();
-
-      return enabled;
-    }
-
-    bool ScratchCurrentRenderTargetLock() {
-      static bool enabled = [] {
-        std::string value = env::getEnvVar("D7VK_RT_LOCK_SCRATCH");
-        return value == "1" || value == "true" || value == "True" || value == "TRUE";
-      }();
-
-      return enabled;
-    }
-
-  }
 
   uint32_t DDraw7Surface::s_surfCount = 0;
 
@@ -850,58 +818,38 @@ namespace dxvk {
 
     const bool currentRenderTarget = m_commonSurf->GetCommonD3DDevice() != nullptr
                                   && m_commonSurf->GetCommonD3DDevice()->IsCurrentRenderTarget(m_commonSurf.ptr());
-    const bool assumeDiscard = currentRenderTarget
-                            && !(dwFlags & DDLOCK_READONLY)
-                            && AssumeCurrentRenderTargetLockDiscard();
 
     if (currentRenderTarget)
       Profiler::record(ProfileEvent::DDraw7LockCurrentRenderTarget, 0u);
 
-    if (currentRenderTarget && DirectCurrentRenderTargetLock()) {
+    // Current-RT locks always take the scratch fast path: hand the game a
+    // CPU scratch buffer and discard its writes at Unlock. Skips D3D9
+    // LockRect's mandatory copyImageToBuffer + WaitForResource — the
+    // single biggest per-frame cost in Ragnarok Online clients, which
+    // lock the RT every frame but neither read the lock pixels nor rely
+    // on its writes landing on the GPU RT.
+    if (currentRenderTarget) {
       ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetLock);
 
-      // Scratch-buffer path (D7VK_RT_LOCK_SCRATCH=1). Hand the game a
-      // CPU scratch buffer and discard its writes at Unlock. Skips D9's
-      // mandatory copyImageToBuffer + WaitForResource on RT LockRect —
-      // the single biggest cost on uaRO's login screen, eliminating
-      // ~1.4 ms/frame of GPU fence wait. Visually correct only when the
-      // game neither reads the lock's pixels nor relies on its writes
-      // landing on the GPU RT.
-      if (unlikely(ScratchCurrentRenderTargetLock())) {
-        const DDSURFACEDESC2* desc = m_commonSurf->GetDesc2();
-        const uint32_t pitch  = (desc->dwWidth ? desc->dwWidth : 1u) * 4u;
-        const uint32_t height = desc->dwHeight ? desc->dwHeight : 1u;
-        const uint32_t size   = pitch * height;
-        if (m_scratchLockSize < size) {
-          m_scratchLockBuffer = std::make_unique<uint8_t[]>(size);
-          m_scratchLockSize   = size;
-        }
-        *lpDDSurfaceDesc = *desc;
-        lpDDSurfaceDesc->lpSurface = m_scratchLockBuffer.get();
-        lpDDSurfaceDesc->lPitch    = pitch;
-        m_scratchLockActive = true;
-        return DD_OK;
+      const DDSURFACEDESC2* desc = m_commonSurf->GetDesc2();
+      const uint32_t pitch  = (desc->dwWidth ? desc->dwWidth : 1u) * 4u;
+      const uint32_t height = desc->dwHeight ? desc->dwHeight : 1u;
+      const uint32_t size   = pitch * height;
+      if (m_scratchLockSize < size) {
+        m_scratchLockBuffer = std::make_unique<uint8_t[]>(size);
+        m_scratchLockSize   = size;
       }
-
-      d3d9::D3DLOCKED_RECT rect9;
-      HRESULT hr9 = m_commonSurf->GetD3D9Surface()->LockRect(&rect9, nullptr,
-        (dwFlags & DDLOCK_READONLY) ? D3DLOCK_READONLY : 0);
-      if (likely(SUCCEEDED(hr9))) {
-        *lpDDSurfaceDesc = *m_commonSurf->GetDesc2();
-        lpDDSurfaceDesc->lpSurface = rect9.pBits;
-        lpDDSurfaceDesc->lPitch = rect9.Pitch;
-        m_directD3D9Lock = true;
-        return DD_OK;
-      }
+      *lpDDSurfaceDesc = *desc;
+      lpDDSurfaceDesc->lpSurface = m_scratchLockBuffer.get();
+      lpDDSurfaceDesc->lPitch    = pitch;
+      m_scratchLockActive = true;
+      return DD_OK;
     }
 
     // Write-only full-surface locks overwrite the old contents, so downloading
     // dirty D3D9 data first only creates avoidable synchronization work.
     if (fullWriteOnlyLock) {
       Profiler::record(ProfileEvent::DDraw7LockFullWriteOnlySkip, 0u);
-    } else if (assumeDiscard) {
-      Profiler::record(ProfileEvent::DDraw7LockCurrentRenderTargetSkip, 0u);
-      m_commonSurf->UnDirtyD3D9Surface();
     } else if (NeedsDownloadSurfaceData()) {
       Profiler::record(ProfileEvent::DDraw7LockDownload, 0u);
       DownloadSurfaceData();
@@ -1053,20 +1001,6 @@ namespace dxvk {
       ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetUnlock);
       m_scratchLockActive = false;
       return DD_OK;
-    }
-
-    if (m_directD3D9Lock) {
-      ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetUnlock);
-
-      m_directD3D9Lock = false;
-      HRESULT hr = m_commonSurf->GetD3D9Surface()->UnlockRect();
-
-      if (likely(SUCCEEDED(hr))) {
-        m_commonSurf->DirtyD3D9Surface();
-        m_commonSurf->UnDirtyDDrawSurface();
-      }
-
-      return hr;
     }
 
     HRESULT hr = GetShadowOrProxied()->Unlock(lpSurfaceData);
