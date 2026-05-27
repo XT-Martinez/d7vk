@@ -60,7 +60,19 @@ namespace dxvk {
         DWORD CreationFlags9)
     : DDrawWrappedObject<D3D7Interface, IDirect3DDevice7>(pParent, std::move(d3d7DeviceProxy))
     , m_commonD3DDevice ( commonD3DDevice )
-    , m_multithread ( CreationFlags9 & D3DCREATE_MULTITHREADED )
+    // The D3D7-layer device lock is forced off. It only guards D3D7-side
+    // state (dedup caches and the draw-batch buffer); the underlying D3D9
+    // device keeps its own lock for actual GPU state regardless. Native
+    // D3D9 pays a single device lock per call, so taking a second recursive
+    // spinlock here on every D3D7 entry point is pure translation-layer
+    // overhead (~2.4k lock/unlock pairs per frame in Ragnarok Online). The
+    // batch buffer is touched only by the render thread's DrawPrimitive /
+    // FlushDrawBatch, and a stale dedup-cache read merely re-applies the
+    // state next call, so dropping the lock is safe for RO's single-threaded
+    // render loop. Revert this initializer to
+    // `CreationFlags9 & D3DCREATE_MULTITHREADED` if a title drives D3D7 from
+    // multiple threads concurrently.
+    , m_multithread ( FALSE )
     , m_desc ( Desc )
     , m_rt ( pSurface ) {
     m_batchVertices.reserve(64u * 1024u);
