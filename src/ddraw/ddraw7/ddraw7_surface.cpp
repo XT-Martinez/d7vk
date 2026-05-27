@@ -269,13 +269,17 @@ namespace dxvk {
 
     d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->RefreshD3D9Device();
     if (likely(d3d9Device != nullptr)) {
-      const bool exclusiveMode = (m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE)
-                              && !m_commonIntf->GetOptions()->ignoreExclusiveMode;
+      // Present directly when the game blits its render target onto the
+      // primary, as long as the underlying D3D9 swapchain is windowed. That
+      // is the case both for windowed DDraw and for DDraw exclusive mode on
+      // setups without real fullscreen-exclusive (VK_EXT_full_screen_exclusive
+      // unavailable) — D7VK maps both to a windowed D3D9 swapchain, so a plain
+      // Present() reaches the screen. Keying on DDraw's exclusive flag instead
+      // black-screened exclusive/fullscreen, since that path fell through to
+      // the proxy Blt which never gets the GPU-rendered RT onto the primary.
+      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters().Windowed;
 
-      // Windowed mode presentation path. Detect it before synchronizing the
-      // D3D9 render target back to DDraw; this path presents directly and never
-      // needs the intermediate DDraw copy.
-      if (!exclusiveMode && lpDDSrcSurface != nullptr && sourceIsWrappedSurface && m_commonSurf->IsPrimarySurface()) {
+      if (d3d9Windowed && lpDDSrcSurface != nullptr && sourceIsWrappedSurface && m_commonSurf->IsPrimarySurface()) {
         Profiler::record(ProfileEvent::DDraw7BltWindowedPrimary, 0u);
 
         DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
@@ -358,13 +362,12 @@ namespace dxvk {
 
     d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->RefreshD3D9Device();
     if (likely(d3d9Device != nullptr)) {
-      const bool exclusiveMode = (m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE)
-                              && !m_commonIntf->GetOptions()->ignoreExclusiveMode;
+      // See the matching comment in Blt: present directly whenever the D3D9
+      // swapchain is windowed, which covers DDraw exclusive mode on setups
+      // without real fullscreen-exclusive.
+      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters().Windowed;
 
-      // Windowed mode presentation path. Detect it before synchronizing the
-      // D3D9 render target back to DDraw; this path presents directly and never
-      // needs the intermediate DDraw copy.
-      if (!exclusiveMode && lpDDSrcSurface != nullptr && sourceIsWrappedSurface && m_commonSurf->IsPrimarySurface()) {
+      if (d3d9Windowed && lpDDSrcSurface != nullptr && sourceIsWrappedSurface && m_commonSurf->IsPrimarySurface()) {
         Profiler::record(ProfileEvent::DDraw7BltFastWindowedPrimary, 0u);
 
         DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
@@ -822,13 +825,18 @@ namespace dxvk {
     if (currentRenderTarget)
       Profiler::record(ProfileEvent::DDraw7LockCurrentRenderTarget, 0u);
 
-    // Current-RT locks always take the scratch fast path: hand the game a
-    // CPU scratch buffer and discard its writes at Unlock. Skips D3D9
-    // LockRect's mandatory copyImageToBuffer + WaitForResource — the
-    // single biggest per-frame cost in Ragnarok Online clients, which
-    // lock the RT every frame but neither read the lock pixels nor rely
-    // on its writes landing on the GPU RT.
-    if (currentRenderTarget) {
+    // The scratch fast path is safe whenever the game presents its render
+    // target to the screen via Blt(primary, RT) → Present — i.e. whenever the
+    // D3D9 swapchain is windowed (see the present path in Blt/BltFast). In
+    // that model the RT's GPU content is what reaches the screen, so the
+    // lock's CPU writes are genuinely throwaway. This holds for both windowed
+    // DDraw and exclusive-mode DDraw on setups without real
+    // fullscreen-exclusive. On a real exclusive swapchain we cannot make that
+    // guarantee, so fall through to the regular proxy lock there.
+    const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice() != nullptr
+                           && m_commonSurf->GetCommonD3DDevice()->GetPresentParameters().Windowed;
+
+    if (currentRenderTarget && d3d9Windowed) {
       ProfileScope directProfile(ProfileEvent::DDraw7DirectRenderTargetLock);
 
       const DDSURFACEDESC2* desc = m_commonSurf->GetDesc2();
