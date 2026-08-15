@@ -1,0 +1,4 @@
+# Local build/output trees (out/, out-builds/, out-<anything>/)
+/out*/
+build*/
+.cache/
