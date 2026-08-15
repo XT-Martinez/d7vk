@@ -298,6 +298,9 @@ namespace dxvk {
       return DDERR_UNSUPPORTED;
     }
 
+    if (m_commonSurf->GetCommonD3DDevice() != nullptr)
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+
     // Write back any dirty surface data from bound D3D9 back buffers or
     // depth stencils, for both the source surface and the current surface
     if (likely(lpDDSrcSurface != nullptr)) {
@@ -314,10 +317,10 @@ namespace dxvk {
 
     d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
     if (likely(d3d9Device != nullptr)) {
-      const bool exclusiveMode = m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE;
+      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
 
       // Windowed mode presentation path
-      if (!exclusiveMode && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
+      if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
         // TODO: Handle this properly, not by uploading the RT again
         DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
         DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
@@ -369,6 +372,9 @@ namespace dxvk {
       return DDERR_UNSUPPORTED;
     }
 
+    if (m_commonSurf->GetCommonD3DDevice() != nullptr)
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+
     const RECT* sourceFullSurfaceRect = nullptr;
     // Write back any dirty surface data from bound D3D9 back buffers or
     // depth stencils, for both the source surface and the current surface
@@ -387,10 +393,10 @@ namespace dxvk {
 
     d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
     if (likely(d3d9Device != nullptr)) {
-      const bool exclusiveMode = m_commonIntf->GetCooperativeLevel() & DDSCL_EXCLUSIVE;
+      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
 
       // Windowed mode presentation path
-      if (!exclusiveMode && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
+      if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
         // TODO: Handle this properly, not by uploading the RT again
         DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
         DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
@@ -596,6 +602,8 @@ namespace dxvk {
         InitializeOrUploadD3D9();
       }
 
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+
       const RECT* presentRect = m_commonSurf->GetCommonD3DDevice()->GetPresentRect();
       d3d9Device->Present(NULL, presentRect, NULL, NULL);
 
@@ -689,6 +697,9 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::GetDC(HDC *lphDC) {
+    if (m_commonSurf->GetCommonD3DDevice() != nullptr)
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+
     // Direct D3D9 path which can sometimes be faster (and other times slower)
     if (unlikely(m_commonIntf->GetOptions()->forceDCForwarding && m_commonSurf->IsInitialized())) {
       InitializeOrUploadD3D9();
@@ -766,6 +777,38 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::Lock(LPRECT lpDestRect, LPDDSURFACEDESC2 lpDDSurfaceDesc, DWORD dwFlags, HANDLE hEvent) {
+    const bool currentRenderTarget = m_commonSurf->GetCommonD3DDevice() != nullptr
+                                  && m_commonSurf->GetCommonD3DDevice()->IsCurrentRenderTarget(m_commonSurf.ptr());
+
+    const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice() != nullptr
+                           && m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
+
+    const bool pureReadOnlyLock = (dwFlags & DDLOCK_READONLY) && !(dwFlags & DDLOCK_WRITEONLY);
+
+    if (currentRenderTarget && d3d9Windowed && lpDDSurfaceDesc != nullptr
+     && unlikely(lpDDSurfaceDesc->dwSize != sizeof(DDSURFACEDESC2)))
+      return DDERR_INVALIDPARAMS;
+
+    if (m_commonSurf->GetCommonD3DDevice() != nullptr
+     && (currentRenderTarget || !pureReadOnlyLock))
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+
+    if (currentRenderTarget && d3d9Windowed && lpDDSurfaceDesc != nullptr) {
+      const DDSURFACEDESC2* desc = m_commonSurf->GetDesc();
+      const uint32_t pitch  = (desc->dwWidth ? desc->dwWidth : 1u) * 4u;
+      const uint32_t height = desc->dwHeight ? desc->dwHeight : 1u;
+      const uint32_t size   = pitch * height;
+      if (m_scratchLockSize < size) {
+        m_scratchLockBuffer = std::make_unique<uint8_t[]>(size);
+        m_scratchLockSize   = size;
+      }
+      *lpDDSurfaceDesc = *desc;
+      lpDDSurfaceDesc->lpSurface = m_scratchLockBuffer.get();
+      lpDDSurfaceDesc->lPitch    = pitch;
+      m_scratchLockActive = true;
+      return DD_OK;
+    }
+
     // Write back any dirty surface data from bound D3D9 back buffers or depth stencils
     DownloadSurfaceData();
 
@@ -917,6 +960,11 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::Unlock(LPRECT lpSurfaceData) {
+    if (unlikely(m_scratchLockActive)) {
+      m_scratchLockActive = false;
+      return DD_OK;
+    }
+
     HRESULT hr = GetShadowOrProxied()->Unlock(lpSurfaceData);
     if (unlikely(FAILED(hr)))
       return hr;
@@ -1003,6 +1051,9 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE DDraw7Surface::SetSurfaceDesc(LPDDSURFACEDESC2 lpDDSD, DWORD dwFlags) {
+    if (m_commonSurf->GetCommonD3DDevice() != nullptr)
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+
     // Can be used only to set the surface data and pixel format
     // used by an explicit system-memory surface (will be validated)
     HRESULT hr = m_proxy->SetSurfaceDesc(lpDDSD, dwFlags);
@@ -1195,6 +1246,12 @@ namespace dxvk {
     // a hack, which by some miracle works well enough in some cases, though may explode in others.
     if (likely(!m_commonIntf->GetOptions()->deviceResourceSharing))
       m_commonSurf->RefreshD3DDevice();
+
+    // Flush any pending D3D7 draws before checking dirtiness, since the
+    // batch does not mark the RT dirty until it is flushed
+    if (m_commonSurf->GetCommonD3DDevice() != nullptr
+     && m_commonSurf->GetCommonD3DDevice()->IsCurrentRenderTarget(m_commonSurf.ptr()))
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
 
     // TODO: We are technically ignoring mip maps as is, though that will probably never be an issue
     if (m_commonSurf->IsD3D9SurfaceDirty() && m_commonSurf->IsInitialized()) {

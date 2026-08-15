@@ -52,6 +52,8 @@ namespace dxvk {
 
     bool IsCurrentRenderTarget(DDrawCommonSurface* commonSurface) const;
 
+    void FlushPendingDraws();
+
     void UpdateSurfaceDirtyTracking(bool dirtyRenderTarget, bool dirtyDepthStencil, bool dirtyPrimarySurface);
 
     HRESULT GetClipStatusCommon(D3DCLIPSTATUS* clip_status);

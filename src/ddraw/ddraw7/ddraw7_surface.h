@@ -9,6 +9,7 @@
 #include "ddraw7_interface.h"
 
 #include <array>
+#include <memory>
 #include <unordered_map>
 
 namespace dxvk {
@@ -226,6 +227,10 @@ namespace dxvk {
     // Back buffers will have depth stencil surfaces as attachments (in practice
     // I have never seen more than one depth stencil being attached at a time)
     Com<DDraw7Surface>                  m_depthStencil;
+
+    std::unique_ptr<uint8_t[]>          m_scratchLockBuffer;
+    uint32_t                            m_scratchLockSize   = 0;
+    bool                                m_scratchLockActive = false;
 
     // These are attached surfaces, which are typically mips or other types of generated
     // surfaces, which need to exist for the entire lifecycle of their parent surface.

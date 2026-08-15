@@ -60,13 +60,20 @@ namespace dxvk {
 
   // D3D5/3 has no way of disabling/re-enabling VSync, so skip the D3D5/3 devices
   HRESULT D3DCommonDevice::ResetD3D9Swapchain(d3d9::D3DPRESENT_PARAMETERS* params) {
+    HRESULT hr;
+
     if (m_device7 != nullptr) {
-      return m_device7->ResetD3D9Swapchain(params);
+      hr = m_device7->ResetD3D9Swapchain(params);
     } else if (m_device6 != nullptr) {
-      return m_device6->ResetD3D9Swapchain(params);
+      hr = m_device6->ResetD3D9Swapchain(params);
+    } else {
+      return DDERR_UNSUPPORTED;
     }
 
-    return DDERR_UNSUPPORTED;
+    if (SUCCEEDED(hr))
+      m_params9 = *params;
+
+    return hr;
   }
 
   DDrawSurface* D3DCommonDevice::GetCurrentRenderTarget() const {
@@ -123,6 +130,11 @@ namespace dxvk {
            m_device6 != nullptr ? m_device6->GetRenderTarget()->GetCommonSurface() == commonSurface :
            m_device5 != nullptr ? m_device5->GetRenderTarget()->GetCommonSurface() == commonSurface :
            m_device3 != nullptr ? m_device3->GetRenderTarget()->GetCommonSurface() == commonSurface : false;
+  }
+
+  void D3DCommonDevice::FlushPendingDraws() {
+    if (m_device7 != nullptr)
+      m_device7->FlushPendingDraws();
   }
 
   // Only needed by D3D6 and earlier viewport clears, so skip the D3D7 device
