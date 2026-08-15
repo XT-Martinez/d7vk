@@ -1,5 +1,7 @@
 #include "d3d7_device.h"
 
+#include <cstring>
+
 #include "../ddraw_common_interface.h"
 
 #include "d3d7_buffer.h"
@@ -8,6 +10,40 @@
 #include "../ddraw7/ddraw7_surface.h"
 
 namespace dxvk {
+
+  namespace {
+
+    // States whose slow-path handler has effects beyond a single D3D9
+    // SetRenderState call (translation tables, side effects on bridge /
+    // common-device caches, etc.). Excluded from the input-dedup fast path
+    // so the slow path always runs and we don't have to update the d3d7
+    // cache at every early-return site.
+    inline bool IsSlowPathD3D7Rs(D3DRENDERSTATETYPE t) {
+      switch (t) {
+        case D3DRENDERSTATE_ANTIALIAS:
+        case D3DRENDERSTATE_TEXTUREPERSPECTIVE:
+        case D3DRENDERSTATE_LINEPATTERN:
+        case D3DRENDERSTATE_ZVISIBLE:
+        case D3DRENDERSTATE_STIPPLEDALPHA:
+        case D3DRENDERSTATE_EDGEANTIALIAS:
+        case D3DRENDERSTATE_COLORKEYENABLE:
+        case D3DRENDERSTATE_ZBIAS:
+        case D3DRENDERSTATE_EXTENTS:
+        case D3DRENDERSTATE_COLORKEYBLENDENABLE:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    // D3DTSS_ADDRESS sets both U and V sampler addresses; an input-keyed
+    // dedup against just (stage, ADDRESS) would miss intervening calls to
+    // ADDRESSU / ADDRESSV. Excluded from the fast path.
+    inline bool IsSlowPathD3D7Tss(D3DTEXTURESTAGESTATETYPE t) {
+      return t == D3DTSS_ADDRESS;
+    }
+
+  }
 
   D3D7Device::D3D7Device(
         D3DCommonDevice* commonD3DDevice,
@@ -20,8 +56,18 @@ namespace dxvk {
         DWORD CreationFlags9)
     : DDrawWrappedObject<D3D7Interface, IDirect3DDevice7>(pParent, std::move(d3d7DeviceProxy))
     , m_commonD3DDevice ( commonD3DDevice )
-    , m_multithread ( CreationFlags9 & D3DCREATE_MULTITHREADED )
+    // The D3D7-layer device lock is forced off. It only guards D3D7-side
+    // state (dedup caches and the draw-batch buffer); the underlying D3D9
+    // device keeps its own lock for actual GPU state regardless. Taking a
+    // second recursive spinlock here on every D3D7 entry point is pure
+    // translation-layer overhead in Ragnarok Online's single-threaded render
+    // loop, which the dedup fast paths below already rely on. Revert this
+    // initializer to `CreationFlags9 & D3DCREATE_MULTITHREADED` if a title
+    // drives D3D7 from multiple threads concurrently.
+    , m_multithread ( FALSE )
     , m_rt ( pSurface ) {
+    m_batchVertices.reserve(64u * 1024u);
+
     if (m_parent != nullptr) {
       m_commonIntf = m_parent->GetCommonInterface();
     } else if (m_commonD3DDevice != nullptr) {
@@ -237,6 +283,8 @@ namespace dxvk {
     if (unlikely(m_commonD3DDevice->IsInScene()))
       return D3DERR_SCENE_IN_SCENE;
 
+    FlushDrawBatch();
+
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->BeginScene();
     if (unlikely(FAILED(hr)))
       return hr;
@@ -253,6 +301,8 @@ namespace dxvk {
 
     if (unlikely(!m_commonD3DDevice->IsInScene()))
       return D3DERR_SCENE_NOT_IN_SCENE;
+
+    FlushDrawBatch();
 
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->EndScene();
     if (unlikely(FAILED(hr)))
@@ -295,6 +345,8 @@ namespace dxvk {
     HRESULT hr = rt7->GetCommonSurface()->ValidateRTUsage7(m_commonD3DDevice->IsHALOrTNLHALDevice(), false);
     if (unlikely(FAILED(hr)))
       return hr;
+
+    FlushDrawBatch();
 
     hr = rt7->InitializeD3D9RenderTarget();
     if (unlikely(FAILED(hr))) {
@@ -354,6 +406,8 @@ namespace dxvk {
     if (unlikely(!count && rects))
       return D3D_OK;
 
+    FlushDrawBatch();
+
     const bool clearRenderTarget = flags & D3DCLEAR_TARGET;
     const bool clearDepthStencil = (flags & D3DCLEAR_ZBUFFER) || (flags & D3DCLEAR_STENCIL);
 
@@ -394,6 +448,7 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetTransform(D3DTRANSFORMSTATETYPE state, D3DMATRIX *matrix) {
+    FlushDrawBatch();
     return m_commonD3DDevice->GetD3D9Device()->SetTransform(ConvertTransformState(state), matrix);
   }
 
@@ -402,6 +457,7 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::MultiplyTransform(D3DTRANSFORMSTATETYPE state, D3DMATRIX *matrix) {
+    FlushDrawBatch();
     return m_commonD3DDevice->GetD3D9Device()->MultiplyTransform(ConvertTransformState(state), matrix);
   }
 
@@ -433,6 +489,8 @@ namespace dxvk {
       data->dvMaxZ = 1.0f;
     }
 
+    FlushDrawBatch();
+
     return m_commonD3DDevice->GetD3D9Device()->SetViewport(reinterpret_cast<d3d9::D3DVIEWPORT9*>(data));
   }
 
@@ -448,6 +506,8 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D7Device::SetMaterial(D3DMATERIAL7 *data) {
     if (unlikely(data == nullptr))
       return DDERR_INVALIDPARAMS;
+
+    FlushDrawBatch();
 
     return m_commonD3DDevice->GetD3D9Device()->SetMaterial(reinterpret_cast<d3d9::D3DMATERIAL9*>(data));
   }
@@ -478,6 +538,8 @@ namespace dxvk {
 
     d3d9::D3DLIGHT9* light9 = reinterpret_cast<d3d9::D3DLIGHT9*>(data);
 
+    FlushDrawBatch();
+
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->SetLight(idx, light9);
     if (unlikely(FAILED(hr)))
       return DDERR_INVALIDPARAMS;
@@ -499,6 +561,21 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetRenderState(D3DRENDERSTATETYPE dwRenderStateType, DWORD dwRenderState) {
+    // Top-level input dedup. Catches the common case of the game re-emitting
+    // identical (type, value) pairs across draws — about 90% of the
+    // SetRenderState calls per frame in Ragnarok Online. Bails out before
+    // LockDevice, the validity check, and the translation switch.
+    {
+      const uint32_t d7Idx = uint32_t(dwRenderStateType);
+      if (likely(d7Idx < MaxD3D7RenderState
+              && !IsSlowPathD3D7Rs(dwRenderStateType)
+              && m_d3d7RsCacheValid[d7Idx]
+              && m_d3d7RsCache[d7Idx] == dwRenderState
+              && !ShouldRecord())) {
+        return D3D_OK;
+      }
+    }
+
     D3DDeviceLock lock = LockDevice();
 
     d3d9::D3DRENDERSTATETYPE State9 = static_cast<d3d9::D3DRENDERSTATETYPE>(dwRenderStateType);
@@ -622,6 +699,8 @@ namespace dxvk {
         break;
 
       case D3DRENDERSTATE_COLORKEYENABLE: {
+        FlushDrawBatch();
+
         m_commonD3DDevice->SetColorKeyEnable(dwRenderState);
 
         for (DWORD stage = 0; stage < ddrawCaps::TextureStageCount; stage++) {
@@ -637,6 +716,8 @@ namespace dxvk {
                                   normalizedColorKey->dwColorSpaceHighValue);
           }
         }
+
+        m_colorKeyCacheValid = false;
 
         return D3D_OK;
       }
@@ -658,6 +739,7 @@ namespace dxvk {
       // D3DPTEXTURECAPS_COLORKEYBLEND isn't advertised by any D3D7 capable
       // or later GPUs, so this render state serves no practical purpose
       case D3DRENDERSTATE_COLORKEYBLENDENABLE:
+        FlushDrawBatch();
         m_commonD3DDevice->SetColorKeyBlendEnable(dwRenderState);
         return D3D_OK;
 
@@ -667,8 +749,34 @@ namespace dxvk {
         return DDERR_INVALIDPARAMS;
     }
 
+    // Dedup against the post-translation D3D9 state. Skip when not recording
+    // (D3D9 defers state changes into a state block while one is open, so the
+    // cached value would not reflect the live device state in that case).
+    const uint32_t rsIdx = uint32_t(State9);
+    const bool canDedupRs = !ShouldRecord() && rsIdx < MaxD3D9RenderState;
+
+    if (canDedupRs && m_d3d9RsCacheValid[rsIdx] && m_d3d9RsCache[rsIdx] == dwRenderState) {
+      return D3D_OK;
+    }
+
+    FlushDrawBatch();
+
     // This call will never fail
-    return m_commonD3DDevice->GetD3D9Device()->SetRenderState(State9, dwRenderState);
+    HRESULT hr = m_commonD3DDevice->GetD3D9Device()->SetRenderState(State9, dwRenderState);
+
+    // Cache valid bits update only on success
+    if (canDedupRs && likely(SUCCEEDED(hr))) {
+      m_d3d9RsCache[rsIdx]      = dwRenderState;
+      m_d3d9RsCacheValid[rsIdx] = true;
+
+      const uint32_t d7Idx = uint32_t(dwRenderStateType);
+      if (likely(d7Idx < MaxD3D7RenderState && !IsSlowPathD3D7Rs(dwRenderStateType))) {
+        m_d3d7RsCache[d7Idx]      = dwRenderState;
+        m_d3d7RsCacheValid[d7Idx] = true;
+      }
+    }
+
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::GetRenderState(D3DRENDERSTATETYPE dwRenderStateType, LPDWORD lpdwRenderState) {
@@ -810,6 +918,8 @@ namespace dxvk {
     if (unlikely(m_recorder != nullptr))
       return D3DERR_INBEGINSTATEBLOCK;
 
+    FlushDrawBatch();
+
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->BeginStateBlock();
     if (unlikely(FAILED(hr)))
       return hr;
@@ -861,6 +971,12 @@ namespace dxvk {
       Logger::err(str::format("D3D7Device::ApplyStateBlock: Invalid dwBlockHandle: ", std::hex, dwBlockHandle));
       return D3DERR_INVALIDSTATEBLOCK;
     }
+
+    FlushDrawBatch();
+
+    // Applying a state block restores arbitrary D3D9 state values, so our
+    // dedup caches no longer reflect what is live on the device.
+    InvalidateDedupCaches();
 
     return stateBlockIter->second.Apply();
   }
@@ -980,16 +1096,77 @@ namespace dxvk {
     if (unlikely(lpvVertices == nullptr))
       return DDERR_INVALIDPARAMS;
 
-    DDrawDirtySurfaceUpload();
+    const uint32_t fvfSize = CachedFVFSize(dwVertexTypeDesc);
+
+    // Map source primitive type to its batched equivalent. Triangle strips
+    // and fans are expanded to triangle-list form during append so they
+    // coalesce with tri-list batches and with each other.
+    D3DPRIMITIVETYPE batchedPrim;
+    switch (d3dptPrimitiveType) {
+      case D3DPT_TRIANGLELIST:
+      case D3DPT_TRIANGLESTRIP:
+      case D3DPT_TRIANGLEFAN:
+        batchedPrim = D3DPT_TRIANGLELIST; break;
+      case D3DPT_LINELIST:
+        batchedPrim = D3DPT_LINELIST;     break;
+      case D3DPT_POINTLIST:
+        batchedPrim = D3DPT_POINTLIST;    break;
+      default:
+        batchedPrim = d3dptPrimitiveType; break;
+    }
+
+    // Batched list draws must hold whole primitives: a per-call remainder
+    // retains the existing immediate-call primitive-count behavior and must
+    // never combine with another call.
+    const bool wholePrimitive = d3dptPrimitiveType == D3DPT_POINTLIST
+                             || d3dptPrimitiveType == D3DPT_TRIANGLESTRIP
+                             || d3dptPrimitiveType == D3DPT_TRIANGLEFAN
+                             || (d3dptPrimitiveType == D3DPT_TRIANGLELIST && dwVertexCount % 3u == 0u)
+                             || (d3dptPrimitiveType == D3DPT_LINELIST && dwVertexCount % 2u == 0u);
+
+    const bool batchable = !ShouldRecord() && wholePrimitive;
+
+    if (batchable) {
+      // Strip/fan with < 3 vertices produces zero triangles; do nothing
+      // rather than disturbing batch state.
+      if ((d3dptPrimitiveType == D3DPT_TRIANGLESTRIP || d3dptPrimitiveType == D3DPT_TRIANGLEFAN)
+          && dwVertexCount < 3u) {
+        return D3D_OK;
+      }
+
+      if (m_batchActive
+          && m_batchPrimType == batchedPrim
+          && m_batchFvf      == dwVertexTypeDesc
+          && m_batchFvfSize  == fvfSize) {
+        AppendVerticesToBatch(d3dptPrimitiveType, lpvVertices, dwVertexCount, fvfSize);
+        return D3D_OK;
+      }
+
+      FlushDrawBatch();
+
+      m_batchActive      = true;
+      m_batchPrimType    = batchedPrim;
+      m_batchFvf         = dwVertexTypeDesc;
+      m_batchFvfSize     = fvfSize;
+      m_batchVertexCount = 0;
+      m_batchVertices.clear();
+      AppendVerticesToBatch(d3dptPrimitiveType, lpvVertices, dwVertexCount, fvfSize);
+      return D3D_OK;
+    }
+
+    // Non-batchable path: flush any pending batch first, then draw immediately.
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
-    device9->SetFVF(dwVertexTypeDesc);
+    DDrawDirtySurfaceUpload();
+
+    SetD3D9FVF(device9, dwVertexTypeDesc);
     HRESULT hr = device9->DrawPrimitiveUP(
                      static_cast<d3d9::D3DPRIMITIVETYPE>(d3dptPrimitiveType),
                      GetPrimitiveCount(d3dptPrimitiveType, dwVertexCount),
                      lpvVertices,
-                     GetFVFSize(dwVertexTypeDesc));
+                     fvfSize);
 
     if (unlikely(FAILED(hr))) {
       Logger::err("D3D7Device::DrawPrimitive: Failed D3D9 call to DrawPrimitiveUP");
@@ -1012,11 +1189,13 @@ namespace dxvk {
     if (unlikely(lpvVertices == nullptr || lpwIndices == nullptr))
       return DDERR_INVALIDPARAMS;
 
-    DDrawDirtySurfaceUpload();
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
-    device9->SetFVF(dwVertexTypeDesc);
+    DDrawDirtySurfaceUpload();
+
+    SetD3D9FVF(device9, dwVertexTypeDesc);
     HRESULT hr = device9->DrawIndexedPrimitiveUP(
                       static_cast<d3d9::D3DPRIMITIVETYPE>(d3dptPrimitiveType),
                       0,
@@ -1062,14 +1241,16 @@ namespace dxvk {
     if (unlikely(lpVertexArray == nullptr))
       return DDERR_INVALIDPARAMS;
 
-    DDrawDirtySurfaceUpload();
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
+
+    DDrawDirtySurfaceUpload();
 
     // Transform strided vertex data to a standard vertex buffer stream
     PackedVertexBuffer pvb = TransformStridedToUP(dwVertexTypeDesc, lpVertexArray, dwVertexCount);
 
-    device9->SetFVF(dwVertexTypeDesc);
+    SetD3D9FVF(device9, dwVertexTypeDesc);
     HRESULT hr = device9->DrawPrimitiveUP(
                      static_cast<d3d9::D3DPRIMITIVETYPE>(d3dptPrimitiveType),
                      GetPrimitiveCount(d3dptPrimitiveType, dwVertexCount),
@@ -1097,14 +1278,16 @@ namespace dxvk {
     if (unlikely(lpVertexArray == nullptr || lpwIndices == nullptr))
       return DDERR_INVALIDPARAMS;
 
-    DDrawDirtySurfaceUpload();
+    FlushDrawBatch();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
+
+    DDrawDirtySurfaceUpload();
 
     // Transform strided vertex data to a standard vertex buffer stream
     PackedVertexBuffer pvb = TransformStridedToUP(dwVertexTypeDesc, lpVertexArray, dwVertexCount);
 
-    device9->SetFVF(dwVertexTypeDesc);
+    SetD3D9FVF(device9, dwVertexTypeDesc);
     HRESULT hr = device9->DrawIndexedPrimitiveUP(
                       static_cast<d3d9::D3DPRIMITIVETYPE>(d3dptPrimitiveType),
                       0,
@@ -1149,11 +1332,13 @@ namespace dxvk {
       return DDERR_GENERIC;
     }
 
+    FlushDrawBatch();
+
     DDrawDirtySurfaceUpload();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
-    device9->SetFVF(commonBuffer->GetFVF());
+    SetD3D9FVF(device9, commonBuffer->GetFVF());
     device9->SetStreamSource(0, commonBuffer->GetD3D9VertexBuffer(), 0, commonBuffer->GetStride());
     HRESULT hr = device9->DrawPrimitive(
                       static_cast<d3d9::D3DPRIMITIVETYPE>(d3dptPrimitiveType),
@@ -1199,6 +1384,8 @@ namespace dxvk {
       return DDERR_UNSUPPORTED;
     }
 
+    FlushDrawBatch();
+
     DDrawDirtySurfaceUpload();
 
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
@@ -1219,7 +1406,7 @@ namespace dxvk {
     ib9->Unlock();
 
     device9->SetIndices(ib9);
-    device9->SetFVF(commonBuffer->GetFVF());
+    SetD3D9FVF(device9, commonBuffer->GetFVF());
     device9->SetStreamSource(0, commonBuffer->GetD3D9VertexBuffer(), 0, commonBuffer->GetStride());
     HRESULT hr = device9->DrawIndexedPrimitive(
                       static_cast<d3d9::D3DPRIMITIVETYPE>(d3dptPrimitiveType),
@@ -1272,6 +1459,55 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetTexture(DWORD stage, IDirectDrawSurface7 *surface) {
+    // Top-level fast path. RO rebinds the same texture every draw (~one
+    // SetTexture per 2 draws), so the same (stage, surface) tuple comes
+    // back over and over. If the surface is the one we already have bound,
+    // is initialized, has no pending DDraw-side dirty data to upload, and
+    // (at stage 0) the color-key configuration hasn't changed, the slow
+    // path's work is a no-op anyway — bail before LockDevice, the wrapper
+    // checks, InitializeOrUploadD3D9, GetD3D9Texture, and the dedup branch.
+    if (likely(stage < ddrawCaps::TextureStageCount
+            && surface != nullptr
+            && m_textures[stage].ptr() == surface
+            && !ShouldRecord())) {
+      DDraw7Surface* surface7 = static_cast<DDraw7Surface*>(surface);
+      DDrawCommonSurface* commonSurf = surface7->GetCommonSurface();
+      if (likely(commonSurf->IsInitialized() && !commonSurf->IsDDrawSurfaceDirty()
+              && commonSurf->GetCommonD3DDevice() == m_commonD3DDevice.ptr())) {
+        // Derive the currently live D3D9 base texture pointer. Any fast
+        // return requires the cached D3D9 binding to exactly match it: this
+        // covers both state-block/reset invalidation and D3D9 object
+        // recreation after ResetD3D9Objects followed by reinitialization.
+        d3d9::IDirect3DBaseTexture9* liveTex = commonSurf->GetD3D9Texture();
+        if (likely(liveTex == nullptr))
+          liveTex = commonSurf->GetD3D9CubeTexture();
+
+        if (likely(m_d3d9TexCacheValid[stage] && m_d3d9TexCache[stage] == liveTex)) {
+          if (stage == 0) {
+            // Stage 0: must also match the color-key configuration captured by
+            // the slow path. The game can mutate the surface's color-key value
+            // independently of SetTexture, so when CK is active we still have to
+            // compare the normalized Low/High to detect that.
+            if (likely(m_colorKeyCacheValid && m_colorKeyLastSurface == surface7)) {
+              const bool colorKeyEnable = m_commonD3DDevice->GetColorKeyEnable();
+              const bool validColorKey  = commonSurf->HasValidColorKey();
+              if (likely(m_colorKeyLastEnable == colorKeyEnable
+                      && m_colorKeyLastValid  == validColorKey)) {
+                if (!(colorKeyEnable && validColorKey))
+                  return D3D_OK;
+                const DDCOLORKEY* ck = commonSurf->GetColorKeyNormalized();
+                if (likely(m_colorKeyLastLow  == ck->dwColorSpaceLowValue
+                        && m_colorKeyLastHigh == ck->dwColorSpaceHighValue))
+                  return D3D_OK;
+              }
+            }
+          } else {
+            return D3D_OK;
+          }
+        }
+      }
+    }
+
     D3DDeviceLock lock = LockDevice();
 
     if (unlikely(stage >= ddrawCaps::TextureStageCount))
@@ -1284,14 +1520,23 @@ namespace dxvk {
 
     // Unbinding texture stages
     if (surface == nullptr) {
-      HRESULT hr = device9->SetTexture(stage, nullptr);
+      HRESULT hr = D3D_OK;
+      if (unlikely(!m_d3d9TexCacheValid[stage] || m_d3d9TexCache[stage] != nullptr)) {
+        FlushDrawBatch();
+        hr = device9->SetTexture(stage, nullptr);
+      }
       if (unlikely(FAILED(hr))) {
         Logger::err("D3D7Device::SetTexture: Failed to unbind D3D9 texture");
         return hr;
       }
 
+      m_d3d9TexCache[stage]      = nullptr;
+      m_d3d9TexCacheValid[stage] = true;
+
       m_textures[stage] = nullptr;
       m_bridge->SetColorKeyState(stage, false);
+      if (stage == 0)
+        m_colorKeyCacheValid = false;
 
       return D3D_OK;
     }
@@ -1329,21 +1574,66 @@ namespace dxvk {
 
         // If a surface without a D3D9 texture gets bound, simply unbind the current texture.
         // This is needed to handle the binding of surfaces which aren't explicitly marked as textures.
-        hr = device9->SetTexture(stage, tex9);
-        if (unlikely(FAILED(hr))) {
-          Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 texture");
-          return hr;
+        // Dedup against the D3D9 texture pointer to skip redundant binds.
+        if (likely(m_d3d9TexCacheValid[stage] && m_d3d9TexCache[stage] == tex9)) {
+        } else {
+          FlushDrawBatch();
+          hr = device9->SetTexture(stage, tex9);
+          if (unlikely(FAILED(hr))) {
+            Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 texture");
+            return hr;
+          }
+          m_d3d9TexCache[stage]      = tex9;
+          m_d3d9TexCacheValid[stage] = true;
         }
 
         if (likely(tex9 != nullptr)) {
           const bool colorKeyEnable = m_commonD3DDevice->GetColorKeyEnable();
           const bool validColorKey = commonSurface->HasValidColorKey();
-          m_bridge->SetColorKeyState(stage, colorKeyEnable && validColorKey);
+          const bool active = colorKeyEnable && validColorKey;
 
-          if (colorKeyEnable && validColorKey) {
+          DWORD newLow  = 0;
+          DWORD newHigh = 0;
+          if (active) {
             const DDCOLORKEY* normalizedColorKey = commonSurface->GetColorKeyNormalized();
-            m_bridge->SetColorKey(stage, normalizedColorKey->dwColorSpaceLowValue,
-                                  normalizedColorKey->dwColorSpaceHighValue);
+            newLow  = normalizedColorKey->dwColorSpaceLowValue;
+            newHigh = normalizedColorKey->dwColorSpaceHighValue;
+          }
+
+          if (likely(stage == 0)) {
+            // The bridge color-key state is global D3D9 state, not per-texture, so
+            // dedup against the color-key VALUE rather than the surface pointer.
+            // In crowded scenes the bound surface changes on nearly every call but
+            // sprites overwhelmingly share the same color-key, so value-keying lets
+            // us skip the bridge SetColorKeyState/SetColorKey calls (and the
+            // ColorKey flush) that the old surface-pointer key forced every bind.
+            const bool cacheHit = m_colorKeyCacheValid
+                               && m_colorKeyLastEnable  == colorKeyEnable
+                               && m_colorKeyLastValid   == validColorKey
+                               && m_colorKeyLastLow     == newLow
+                               && m_colorKeyLastHigh    == newHigh;
+
+            if (!cacheHit) {
+              if (m_batchActive)
+                FlushDrawBatch();
+              m_bridge->SetColorKeyState(stage, active);
+              if (active)
+                m_bridge->SetColorKey(stage, newLow, newHigh);
+
+              m_colorKeyLastEnable  = colorKeyEnable;
+              m_colorKeyLastValid   = validColorKey;
+              m_colorKeyLastLow     = newLow;
+              m_colorKeyLastHigh    = newHigh;
+              m_colorKeyCacheValid  = true;
+            }
+
+            // Always refresh so the top-level same-surface fast path stays coherent
+            // even when the value-keyed cache hit above skipped the update.
+            m_colorKeyLastSurface = surface7;
+          } else {
+            m_bridge->SetColorKeyState(stage, active);
+            if (active)
+              m_bridge->SetColorKey(stage, newLow, newHigh);
           }
         }
 
@@ -1353,10 +1643,16 @@ namespace dxvk {
       case D3D9SurfaceType::CubeTexture: {
         d3d9::IDirect3DCubeTexture9* cube9 = commonSurface->GetD3D9CubeTexture();
 
-        hr = device9->SetTexture(stage, cube9);
-        if (unlikely(FAILED(hr))) {
-          Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 cube texture");
-          return hr;
+        if (likely(m_d3d9TexCacheValid[stage] && m_d3d9TexCache[stage] == cube9)) {
+        } else {
+          FlushDrawBatch();
+          hr = device9->SetTexture(stage, cube9);
+          if (unlikely(FAILED(hr))) {
+            Logger::warn("D3D7Device::SetTexture: Failed to bind D3D9 cube texture");
+            return hr;
+          }
+          m_d3d9TexCache[stage]      = cube9;
+          m_d3d9TexCacheValid[stage] = true;
         }
 
         const bool colorKeyEnable = m_commonD3DDevice->GetColorKeyEnable();
@@ -1373,6 +1669,7 @@ namespace dxvk {
         break;
       }
     }
+
 
     m_textures[stage] = surface7;
 
@@ -1415,29 +1712,85 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetTextureStageState(DWORD dwStage, D3DTEXTURESTAGESTATETYPE d3dTexStageStateType, DWORD dwState) {
+    // Top-level input dedup. Catches the common case of the game re-emitting
+    // identical (stage, type, value) tuples per draw — ~90% of the TSS calls
+    // per frame in Ragnarok Online. Bails out before the device fetch,
+    // the translation, and the D3D9 call.
+    {
+      const uint32_t d7Idx = uint32_t(d3dTexStageStateType);
+      if (likely(dwStage < ddrawCaps::TextureStageCount
+              && d7Idx < MaxD3D7TextureStageState
+              && !IsSlowPathD3D7Tss(d3dTexStageStateType)
+              && m_d3d7TssCacheValid[dwStage][d7Idx]
+              && m_d3d7TssCache[dwStage][d7Idx] == dwState
+              && !ShouldRecord())) {
+        return D3D_OK;
+      }
+    }
+
     d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
 
+    const bool canDedup = !ShouldRecord() && dwStage < ddrawCaps::TextureStageCount;
+
+    auto trySetSampler = [&](d3d9::D3DSAMPLERSTATETYPE ss, DWORD value) -> HRESULT {
+      const uint32_t idx = uint32_t(ss);
+      const bool dedup   = canDedup && idx < MaxD3D9SamplerState;
+      if (dedup && m_d3d9SsCacheValid[dwStage][idx] && m_d3d9SsCache[dwStage][idx] == value) {
+        return D3D_OK;
+      }
+      FlushDrawBatch();
+      HRESULT hr = device9->SetSamplerState(dwStage, ss, value);
+      if (dedup && likely(SUCCEEDED(hr))) {
+        m_d3d9SsCache[dwStage][idx]      = value;
+        m_d3d9SsCacheValid[dwStage][idx] = true;
+      }
+      return hr;
+    };
+
     // In the case of D3DTSS_ADDRESS, which is exclusive to D3D7
-    // and D3D6, we need to set up both D3DTSS_ADDRESSU and D3DTSS_ADDRESSV
+    // and D3D6, we need to set up both D3DTSS_ADDRESSU and D3DTSS_ADDRESSV.
+    // Excluded from input dedup (see IsSlowPathD3D7Tss).
     if (d3dTexStageStateType == D3DTSS_ADDRESS) {
-      device9->SetSamplerState(dwStage, d3d9::D3DSAMP_ADDRESSU, dwState);
-      return device9->SetSamplerState(dwStage, d3d9::D3DSAMP_ADDRESSV, dwState);
+      trySetSampler(d3d9::D3DSAMP_ADDRESSU, dwState);
+      return trySetSampler(d3d9::D3DSAMP_ADDRESSV, dwState);
     }
 
     d3d9::D3DSAMPLERSTATETYPE stateType = ConvertSamplerStateType(d3dTexStageStateType);
+    HRESULT hr;
 
     // If the type has been remapped to a sampler state type
     if (stateType != -1u) {
       // MAG/MIN/MIP filter enums are each different than the unified D3D9 D3DTEXTUREFILTERTYPE
       if (stateType == d3d9::D3DSAMP_MAGFILTER || stateType == d3d9::D3DSAMP_MINFILTER || stateType == d3d9::D3DSAMP_MIPFILTER) {
         const DWORD dwState9 = ConvertLegacyD3DTexFilterValues(d3dTexStageStateType, dwState);
-        return device9->SetSamplerState(dwStage, stateType, dwState9);
+        hr = trySetSampler(stateType, dwState9);
       } else {
-        return device9->SetSamplerState(dwStage, stateType, dwState);
+        hr = trySetSampler(stateType, dwState);
       }
     } else {
-      return device9->SetTextureStageState(dwStage, static_cast<d3d9::D3DTEXTURESTAGESTATETYPE>(d3dTexStageStateType), dwState);
+      const uint32_t idx = uint32_t(d3dTexStageStateType);
+      const bool dedup   = canDedup && idx < MaxD3D9TextureStageState;
+      if (dedup && m_d3d9TssCacheValid[dwStage][idx] && m_d3d9TssCache[dwStage][idx] == dwState) {
+        hr = D3D_OK;
+      } else {
+        FlushDrawBatch();
+        hr = device9->SetTextureStageState(dwStage, static_cast<d3d9::D3DTEXTURESTAGESTATETYPE>(d3dTexStageStateType), dwState);
+        if (dedup && likely(SUCCEEDED(hr))) {
+          m_d3d9TssCache[dwStage][idx]      = dwState;
+          m_d3d9TssCacheValid[dwStage][idx] = true;
+        }
+      }
     }
+
+    // Populate d3d7 input cache so subsequent identical calls hit the fast path.
+    if (canDedup && likely(SUCCEEDED(hr))) {
+      const uint32_t d7Idx = uint32_t(d3dTexStageStateType);
+      if (likely(d7Idx < MaxD3D7TextureStageState)) {
+        m_d3d7TssCache[dwStage][d7Idx]      = dwState;
+        m_d3d7TssCacheValid[dwStage][d7Idx] = true;
+      }
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::ValidateDevice(LPDWORD lpdwPasses) {
@@ -1500,6 +1853,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::LightEnable(DWORD dwLightIndex, BOOL bEnable) {
+    FlushDrawBatch();
+
     HRESULT hr = m_commonD3DDevice->GetD3D9Device()->LightEnable(dwLightIndex, bEnable);
     if (unlikely(FAILED(hr)))
       return DDERR_INVALIDPARAMS;
@@ -1537,6 +1892,7 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D7Device::SetClipPlane(DWORD dwIndex, D3DVALUE *pPlaneEquation) {
+    FlushDrawBatch();
     return m_commonD3DDevice->GetD3D9Device()->SetClipPlane(dwIndex, pPlaneEquation);
   }
 
@@ -1596,14 +1952,146 @@ namespace dxvk {
     }
   }
 
+  void D3D7Device::SetD3D9FVF(d3d9::IDirect3DDevice9* device9, DWORD fvf) {
+    // While a state block is being recorded, D3D9 defers the state change,
+    // so the cached value would not reflect the live device state. Call the
+    // underlying SetFVF unconditionally and preserve the void/error behavior.
+    if (unlikely(ShouldRecord())) {
+      device9->SetFVF(fvf);
+      return;
+    }
+
+    if (likely(m_lastSetFvfValid && m_lastSetFvf == fvf))
+      return;
+
+    // Cache valid bits update only on success
+    if (likely(SUCCEEDED(device9->SetFVF(fvf)))) {
+      m_lastSetFvf      = fvf;
+      m_lastSetFvfValid = true;
+    }
+  }
+
+  void D3D7Device::AppendVerticesToBatch(D3DPRIMITIVETYPE sourcePrim, const void* vertices, uint32_t vertexCount, uint32_t fvfSize) {
+    const uint8_t* src = static_cast<const uint8_t*>(vertices);
+
+    switch (sourcePrim) {
+      case D3DPT_TRIANGLELIST:
+      case D3DPT_LINELIST:
+      case D3DPT_POINTLIST: {
+        const size_t bytes   = size_t(vertexCount) * fvfSize;
+        const size_t oldSize = m_batchVertices.size();
+        m_batchVertices.resize(oldSize + bytes);
+        std::memcpy(m_batchVertices.data() + oldSize, src, bytes);
+        m_batchVertexCount += vertexCount;
+        return;
+      }
+
+      case D3DPT_TRIANGLESTRIP: {
+        if (unlikely(vertexCount < 3u)) return;
+        const uint32_t triCount = vertexCount - 2u;
+        const size_t   bytes    = size_t(triCount) * 3u * fvfSize;
+        const size_t   oldSize  = m_batchVertices.size();
+        m_batchVertices.resize(oldSize + bytes);
+        uint8_t* dst = m_batchVertices.data() + oldSize;
+
+        // D3D triangle strip: the source provoking vertex for triangle i is
+        // source vertex i. Even triangles are emitted as (v[i], v[i+1],
+        // v[i+2]) and odd ones as (v[i], v[i+2], v[i+1]): the first vertex
+        // stays the source provoking vertex while the swap of the trailing
+        // vertices retains the rasterizer winding across the strip.
+        for (uint32_t i = 0; i < triCount; i++) {
+          const uint32_t a = i;
+          const uint32_t b = (i & 1u) ? (i + 2u) : (i + 1u);
+          const uint32_t c = (i & 1u) ? (i + 1u) : (i + 2u);
+          std::memcpy(dst,                src + size_t(a) * fvfSize, fvfSize);
+          std::memcpy(dst + fvfSize,      src + size_t(b) * fvfSize, fvfSize);
+          std::memcpy(dst + 2u * fvfSize, src + size_t(c) * fvfSize, fvfSize);
+          dst += 3u * size_t(fvfSize);
+        }
+        m_batchVertexCount += triCount * 3u;
+        return;
+      }
+
+      case D3DPT_TRIANGLEFAN: {
+        if (unlikely(vertexCount < 3u)) return;
+        const uint32_t triCount = vertexCount - 2u;
+        const size_t   bytes    = size_t(triCount) * 3u * fvfSize;
+        const size_t   oldSize  = m_batchVertices.size();
+        m_batchVertices.resize(oldSize + bytes);
+        uint8_t* dst = m_batchVertices.data() + oldSize;
+
+        // D3D triangle fan: the source provoking vertex for triangle i is
+        // source vertex i+1. Emitted as (v[i+1], v[i+2], v[0]), a cyclic
+        // rotation of (v[0], v[i+1], v[i+2]) that keeps the provoking vertex
+        // first while retaining the rasterizer winding.
+        for (uint32_t i = 0; i < triCount; i++) {
+          std::memcpy(dst,                src + size_t(i + 1u) * fvfSize, fvfSize);
+          std::memcpy(dst + fvfSize,      src + size_t(i + 2u) * fvfSize, fvfSize);
+          std::memcpy(dst + 2u * fvfSize, src,                             fvfSize);
+          dst += 3u * size_t(fvfSize);
+        }
+        m_batchVertexCount += triCount * 3u;
+        return;
+      }
+
+      default: return;
+    }
+  }
+
+  void D3D7Device::FlushDrawBatch() {
+    if (likely(!m_batchActive))
+      return;
+
+    d3d9::IDirect3DDevice9* device9 = m_commonD3DDevice->GetD3D9Device();
+
+    DDrawDirtySurfaceUpload();
+
+    SetD3D9FVF(device9, m_batchFvf);
+    HRESULT hr = device9->DrawPrimitiveUP(
+                     d3d9::D3DPRIMITIVETYPE(m_batchPrimType),
+                     GetPrimitiveCount(m_batchPrimType, m_batchVertexCount),
+                     m_batchVertices.data(),
+                     m_batchFvfSize);
+
+    if (unlikely(FAILED(hr)))
+      Logger::err("D3D7Device::FlushDrawBatch: Failed D3D9 call to DrawPrimitiveUP");
+    else
+      UpdateSurfaceDirtyTracking(true, m_commonD3DDevice->IsDepthWriteEnabled(), true);
+
+    m_batchActive      = false;
+    m_batchVertexCount = 0;
+    m_batchVertices.clear();
+  }
+
+  void D3D7Device::FlushPendingDraws() {
+    FlushDrawBatch();
+  }
+
+  void D3D7Device::InvalidateDedupCaches() {
+    std::memset(m_d3d9RsCacheValid,  0, sizeof(m_d3d9RsCacheValid));
+    std::memset(m_d3d9SsCacheValid,  0, sizeof(m_d3d9SsCacheValid));
+    std::memset(m_d3d9TssCacheValid, 0, sizeof(m_d3d9TssCacheValid));
+    std::memset(m_d3d9TexCacheValid, 0, sizeof(m_d3d9TexCacheValid));
+    std::memset(m_d3d7RsCacheValid,  0, sizeof(m_d3d7RsCacheValid));
+    std::memset(m_d3d7TssCacheValid, 0, sizeof(m_d3d7TssCacheValid));
+    m_colorKeyCacheValid = false;
+    m_lastSetFvfValid    = false;
+  }
+
   HRESULT D3D7Device::ResetD3D9Swapchain(d3d9::D3DPRESENT_PARAMETERS* params) {
     Logger::info("D3D7Device::ResetD3D9Swapchain: Resetting the D3D9 swapchain");
+
+    FlushDrawBatch();
 
     HRESULT hr = m_bridge->ResetSwapChain(params);
     if (unlikely(FAILED(hr))) {
       Logger::err("D3D7Device::ResetD3D9Swapchain: Failed to reset the D3D9 swapchain");
       return hr;
     }
+
+    // The swapchain reset restores arbitrary D3D9 state values, so our
+    // dedup caches no longer reflect what is live on the device
+    InvalidateDedupCaches();
 
     DDrawCommonSurface* commonSurface = m_rt->GetCommonSurface();
     commonSurface->ResetD3D9Objects();

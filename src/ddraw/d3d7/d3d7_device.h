@@ -17,6 +17,7 @@
 
 #include <array>
 #include <unordered_map>
+#include <vector>
 
 namespace dxvk {
 
@@ -148,6 +149,10 @@ namespace dxvk {
 
     HRESULT ResetD3D9Swapchain(d3d9::D3DPRESENT_PARAMETERS* params);
 
+    // Public internal entry point (not COM) that flushes any pending batched
+    // draw, forwarding to the private batching implementation.
+    void FlushPendingDraws();
+
     D3DCommonDevice* GetCommonD3DDevice() {
       return m_commonD3DDevice.ptr();
     }
@@ -176,6 +181,26 @@ namespace dxvk {
     inline void DDrawDirtySurfaceUpload();
 
     inline bool ShouldRecord() const { return m_recorder != nullptr; }
+
+    void InvalidateDedupCaches();
+
+    void FlushDrawBatch();
+
+    // Append vertices into the active batch, expanding triangle strips and
+    // fans into triangle-list form so they can coalesce with regular tri-list
+    // draws. Caller must have already started the batch with effective
+    // primitive type D3DPT_TRIANGLELIST (or D3DPT_LINELIST / D3DPT_POINTLIST
+    // for the line/point cases, which pass through unchanged).
+    void AppendVerticesToBatch(D3DPRIMITIVETYPE sourcePrim, const void* vertices, uint32_t vertexCount, uint32_t fvfSize);
+
+    // SetFVF dedup: the underlying D3D9 SetFVF does a hashmap lookup
+    // (m_fvfTable) on every call before early-outing on an unchanged
+    // declaration. Every draw entry point sets the FVF, so in Ragnarok Online
+    // this fires thousands of times per frame, almost always with the same
+    // value. Cache the last value set and skip the COM call when unchanged.
+    // Routed through here by all draw paths; invalidated in
+    // InvalidateDedupCaches() (device reset).
+    void SetD3D9FVF(d3d9::IDirect3DDevice9* device9, DWORD fvf);
 
     inline void RefreshLastUsedDevice() {
       if (unlikely(m_commonD3DDevice != m_commonIntf->GetCommonD3DDevice()))
@@ -206,6 +231,78 @@ namespace dxvk {
     std::unordered_map<DWORD, D3D7StateBlock> m_stateBlocks;
 
     std::array<Com<d3d9::IDirect3DIndexBuffer9>, ddrawCaps::IndexBufferCount> m_ib9;
+
+    // Dedup caches for D3D9-side state. Indexed by the post-translation D3D9
+    // state enum. Sized to comfortably cover the highest enum value in use.
+    static constexpr uint32_t MaxD3D9RenderState       = 256;
+    static constexpr uint32_t MaxD3D9SamplerState      = 16;
+    static constexpr uint32_t MaxD3D9TextureStageState = 64;
+
+    DWORD m_d3d9RsCache[MaxD3D9RenderState]                                    = { };
+    bool  m_d3d9RsCacheValid[MaxD3D9RenderState]                               = { };
+
+    DWORD m_d3d9SsCache[ddrawCaps::TextureStageCount][MaxD3D9SamplerState]     = { };
+    bool  m_d3d9SsCacheValid[ddrawCaps::TextureStageCount][MaxD3D9SamplerState]= { };
+
+    DWORD m_d3d9TssCache[ddrawCaps::TextureStageCount][MaxD3D9TextureStageState]    = { };
+    bool  m_d3d9TssCacheValid[ddrawCaps::TextureStageCount][MaxD3D9TextureStageState] = { };
+
+    // D3D7-input dedup caches. Hot-path optimization: when the game re-emits
+    // the same (type, value) pair, we short-circuit at the very top of
+    // SetRenderState / SetTextureStageState — no translation, no LockDevice.
+    // Keyed on the raw D3D7 input; only populated for types that the slow
+    // path treats as 1:1 translations (no side effects beyond a single D3D9
+    // SetRenderState / SetTextureStageState / SetSamplerState call).
+    static constexpr uint32_t MaxD3D7RenderState       = 256;
+    static constexpr uint32_t MaxD3D7TextureStageState = 32;
+
+    DWORD m_d3d7RsCache[MaxD3D7RenderState]                                    = { };
+    bool  m_d3d7RsCacheValid[MaxD3D7RenderState]                               = { };
+
+    DWORD m_d3d7TssCache[ddrawCaps::TextureStageCount][MaxD3D7TextureStageState] = { };
+    bool  m_d3d7TssCacheValid[ddrawCaps::TextureStageCount][MaxD3D7TextureStageState] = { };
+
+    d3d9::IDirect3DBaseTexture9* m_d3d9TexCache[ddrawCaps::TextureStageCount]  = { };
+    bool                         m_d3d9TexCacheValid[ddrawCaps::TextureStageCount] = { };
+
+    // Color-key bridge state cached at stage 0.
+    DDraw7Surface*        m_colorKeyLastSurface     = nullptr;
+    bool                  m_colorKeyLastEnable      = false;
+    bool                  m_colorKeyLastValid       = false;
+    DWORD                 m_colorKeyLastLow         = 0;
+    DWORD                 m_colorKeyLastHigh        = 0;
+    bool                  m_colorKeyCacheValid      = false;
+
+    // DrawPrimitive batching. Consecutive DrawPrimitive calls with the
+    // same primitive type and FVF are accumulated into a single vertex blob
+    // and emitted as one DrawPrimitiveUP call. Flushed on any state change,
+    // scene boundary, or alternative draw entry point.
+    bool                  m_batchActive       = false;
+    D3DPRIMITIVETYPE      m_batchPrimType     = D3DPT_TRIANGLELIST;
+    DWORD                 m_batchFvf          = 0;
+    uint32_t              m_batchFvfSize      = 0;
+    uint32_t              m_batchVertexCount  = 0;
+    std::vector<uint8_t>  m_batchVertices;
+
+    // SetFVF dedup cache. See SetD3D9FVF.
+    DWORD                 m_lastSetFvf        = 0;
+    bool                  m_lastSetFvfValid   = false;
+
+    // GetFVFSize memoization. The FVF is near-constant in Ragnarok Online
+    // (changes ~twice/frame) yet DrawPrimitive recomputes the size by walking
+    // the FVF bits on every call (thousands/frame). Cache the last result.
+    DWORD                 m_fvfSizeKey        = 0;
+    uint32_t              m_fvfSizeVal        = 0;
+    bool                  m_fvfSizeValid      = false;
+
+    inline uint32_t CachedFVFSize(DWORD fvf) {
+      if (likely(m_fvfSizeValid && m_fvfSizeKey == fvf))
+        return m_fvfSizeVal;
+      m_fvfSizeVal   = uint32_t(GetFVFSize(fvf));
+      m_fvfSizeKey   = fvf;
+      m_fvfSizeValid = true;
+      return m_fvfSizeVal;
+    }
 
   };
 
