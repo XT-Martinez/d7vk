@@ -140,11 +140,19 @@ Commit IDs may change during local autosquash until the final audit, so units
 ### Validation status
 
 - A 32-bit release build of the transplanted series completed in the Podman
-  container (283 targets) and produced `out-builds/verify-ro-latest/d7vk-ro-latest/x32/ddraw.dll`
-  (PE32 i386).
-- Manual uaRO gameplay validation and the same-session A/B comparison remain
-  **user-operated and pending**. They have not been claimed as passed, and no
-  historical measurement above is offered as proof of current performance.
+  container (**283/283 targets**) and produced
+  `out-builds/verify-ro-latest/d7vk-ro-latest/x32/ddraw.dll` (PE32 i386).
+- Two independent code reviewers found no blockers or warnings.
+- Validated live on **2026-08-16** through the Heroic runner; the full
+  discovery → back-up → hash → deploy → launch → verify → benchmark → restore
+  workflow is documented in [`ragnarok-profiling.md`](ragnarok-profiling.md).
+  Controlled Xwayland old-vs-new A/B in the same session: reviewed rebased
+  build 396.1 average FPS, pre-review rebased 402.4, trusted pre-rebase 867.9,
+  fixed 879.6. Fixed native-Wayland validation: 1388.7 average FPS (not a
+  controlled old-vs-new native A/B).
+- The historical measurements in the Research Record below describe their own
+  build/flag/workload context and are **not** offered as proof of current
+  performance; use the 2026-08-16 results and the Heroic workflow instead.
 
 ---
 
