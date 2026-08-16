@@ -298,6 +298,26 @@ namespace dxvk {
       return DDERR_UNSUPPORTED;
     }
 
+    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+    if (likely(d3d9Device != nullptr)) {
+      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
+
+      // Windowed mode presentation path
+      if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
+        // TODO: Handle this properly, not by uploading the RT again
+        DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
+        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
+
+        if (sourceSurface == renderTarget) {
+          if (m_commonSurf->GetCommonD3DDevice() != nullptr)
+            m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+          renderTarget->InitializeOrUploadD3D9();
+          d3d9Device->Present(NULL, NULL, NULL, NULL);
+          return DD_OK;
+        }
+      }
+    }
+
     if (m_commonSurf->GetCommonD3DDevice() != nullptr)
       m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
 
@@ -313,24 +333,6 @@ namespace dxvk {
       m_commonSurf->UnDirtyD3D9Surface();
     } else {
       DownloadSurfaceData();
-    }
-
-    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
-    if (likely(d3d9Device != nullptr)) {
-      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
-
-      // Windowed mode presentation path
-      if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
-        // TODO: Handle this properly, not by uploading the RT again
-        DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
-        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
-
-        if (sourceSurface == renderTarget) {
-          renderTarget->InitializeOrUploadD3D9();
-          d3d9Device->Present(NULL, NULL, NULL, NULL);
-          return DD_OK;
-        }
-      }
     }
 
     HRESULT hr;
@@ -372,6 +374,26 @@ namespace dxvk {
       return DDERR_UNSUPPORTED;
     }
 
+    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+    if (likely(d3d9Device != nullptr)) {
+      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
+
+      // Windowed mode presentation path
+      if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
+        // TODO: Handle this properly, not by uploading the RT again
+        DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
+        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
+
+        if (sourceSurface == renderTarget) {
+          if (m_commonSurf->GetCommonD3DDevice() != nullptr)
+            m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+          renderTarget->InitializeOrUploadD3D9();
+          d3d9Device->Present(NULL, NULL, NULL, NULL);
+          return DD_OK;
+        }
+      }
+    }
+
     if (m_commonSurf->GetCommonD3DDevice() != nullptr)
       m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
 
@@ -389,24 +411,6 @@ namespace dxvk {
       m_commonSurf->UnDirtyD3D9Surface();
     } else {
       DownloadSurfaceData();
-    }
-
-    d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
-    if (likely(d3d9Device != nullptr)) {
-      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
-
-      // Windowed mode presentation path
-      if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
-        // TODO: Handle this properly, not by uploading the RT again
-        DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
-        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
-
-        if (sourceSurface == renderTarget) {
-          renderTarget->InitializeOrUploadD3D9();
-          d3d9Device->Present(NULL, NULL, NULL, NULL);
-          return DD_OK;
-        }
-      }
     }
 
     HRESULT hr;
