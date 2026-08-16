@@ -2129,15 +2129,28 @@ namespace dxvk {
   }
 
   inline void D3D7Device::DDrawDirtySurfaceUpload() {
+    // Upload a surface only when it is attached to this device's common
+    // device and not already initialized with clean DDraw-side data.
+    // This preserves device refresh/reset, initialization, P8, and upload
+    // behavior for every other case.
+    const auto uploadIfNeeded = [this](DDraw7Surface* surface) {
+      DDrawCommonSurface* commonSurface = surface->GetCommonSurface();
+      if (likely(commonSurface->GetCommonD3DDevice() == m_commonD3DDevice.ptr()
+              && commonSurface->IsInitialized()
+              && !commonSurface->IsDDrawSurfaceDirty()))
+        return;
+      surface->InitializeOrUploadD3D9();
+    };
+
     // Render target
-    m_rt->InitializeOrUploadD3D9();
+    uploadIfNeeded(m_rt.ptr());
     // Depth stencil (if present)
     if (likely(m_ds != nullptr))
-      m_ds->InitializeOrUploadD3D9();
+      uploadIfNeeded(m_ds.ptr());
     // Bound texture(s)
     for (auto& tex : m_textures) {
       if (tex.ptr() != nullptr)
-        tex->InitializeOrUploadD3D9();
+        uploadIfNeeded(tex.ptr());
     }
   }
 
