@@ -299,18 +299,19 @@ namespace dxvk {
     }
 
     d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+    D3DCommonDevice* commonD3DDevice = m_commonSurf->GetCommonD3DDevice();
     if (likely(d3d9Device != nullptr)) {
-      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
+      const bool d3d9Windowed = commonD3DDevice->GetPresentParameters()->Windowed;
 
       // Windowed mode presentation path
       if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
         // TODO: Handle this properly, not by uploading the RT again
         DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
-        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
+        DDraw7Surface* renderTarget = commonD3DDevice->GetCurrentRenderTarget7();
 
         if (sourceSurface == renderTarget) {
-          if (m_commonSurf->GetCommonD3DDevice() != nullptr)
-            m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+          if (commonD3DDevice != nullptr)
+            commonD3DDevice->FlushPendingDraws();
           renderTarget->InitializeOrUploadD3D9();
           d3d9Device->Present(NULL, NULL, NULL, NULL);
           return DD_OK;
@@ -318,8 +319,8 @@ namespace dxvk {
       }
     }
 
-    if (m_commonSurf->GetCommonD3DDevice() != nullptr)
-      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+    if (commonD3DDevice != nullptr)
+      commonD3DDevice->FlushPendingDraws();
 
     // Write back any dirty surface data from bound D3D9 back buffers or
     // depth stencils, for both the source surface and the current surface
@@ -375,18 +376,19 @@ namespace dxvk {
     }
 
     d3d9::IDirect3DDevice9* d3d9Device = m_commonSurf->GetRefreshedD3D9Device();
+    D3DCommonDevice* commonD3DDevice = m_commonSurf->GetCommonD3DDevice();
     if (likely(d3d9Device != nullptr)) {
-      const bool d3d9Windowed = m_commonSurf->GetCommonD3DDevice()->GetPresentParameters()->Windowed;
+      const bool d3d9Windowed = commonD3DDevice->GetPresentParameters()->Windowed;
 
       // Windowed mode presentation path
       if (d3d9Windowed && lpDDSrcSurface != nullptr && m_commonSurf->IsPrimarySurface()) {
         // TODO: Handle this properly, not by uploading the RT again
         DDraw7Surface* sourceSurface = static_cast<DDraw7Surface*>(lpDDSrcSurface);
-        DDraw7Surface* renderTarget = m_commonSurf->GetCommonD3DDevice()->GetCurrentRenderTarget7();
+        DDraw7Surface* renderTarget = commonD3DDevice->GetCurrentRenderTarget7();
 
         if (sourceSurface == renderTarget) {
-          if (m_commonSurf->GetCommonD3DDevice() != nullptr)
-            m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+          if (commonD3DDevice != nullptr)
+            commonD3DDevice->FlushPendingDraws();
           renderTarget->InitializeOrUploadD3D9();
           d3d9Device->Present(NULL, NULL, NULL, NULL);
           return DD_OK;
@@ -394,8 +396,8 @@ namespace dxvk {
       }
     }
 
-    if (m_commonSurf->GetCommonD3DDevice() != nullptr)
-      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
+    if (commonD3DDevice != nullptr)
+      commonD3DDevice->FlushPendingDraws();
 
     const RECT* sourceFullSurfaceRect = nullptr;
     // Write back any dirty surface data from bound D3D9 back buffers or
@@ -793,10 +795,6 @@ namespace dxvk {
      && unlikely(lpDDSurfaceDesc->dwSize != sizeof(DDSURFACEDESC2)))
       return DDERR_INVALIDPARAMS;
 
-    if (m_commonSurf->GetCommonD3DDevice() != nullptr
-     && (currentRenderTarget || !pureReadOnlyLock))
-      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
-
     if (currentRenderTarget && d3d9Windowed && lpDDSurfaceDesc != nullptr) {
       const DDSURFACEDESC2* desc = m_commonSurf->GetDesc();
       const uint32_t pitch  = (desc->dwWidth ? desc->dwWidth : 1u) * 4u;
@@ -812,6 +810,10 @@ namespace dxvk {
       m_scratchLockActive = true;
       return DD_OK;
     }
+
+    if (m_commonSurf->GetCommonD3DDevice() != nullptr
+     && (currentRenderTarget || !pureReadOnlyLock))
+      m_commonSurf->GetCommonD3DDevice()->FlushPendingDraws();
 
     // Write back any dirty surface data from bound D3D9 back buffers or depth stencils
     DownloadSurfaceData();
