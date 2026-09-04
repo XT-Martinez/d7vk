@@ -16,7 +16,7 @@ to build, install, and measure the current tree.
 
 ---
 
-## Current State (2026-08-15)
+## Current State (2026-08-22)
 
 ### Branch and anchor
 
@@ -95,6 +95,16 @@ Commit IDs may change during local autosquash until the final audit, so units
   current-render-target `Lock`, `GetDC`, and `SetSurfaceDesc` recreation. These
   are the covered boundaries, not a claim that every conceivable DirectDraw
   boundary is handled. Dedup hits do not flush.
+  Refinements from the 2026-08-16 follow-up commits:
+  - The scratch current-RT `Lock` fast path returns before any batch flush
+    (`bb4669599`); non-scratch locks and writable locks still flush first.
+  - The windowed RT-present early-out in destination `Blt`/`BltFast` runs
+    **before** the download/write-back block, so an RT-to-primary present no
+    longer pays a render-target readback (`17b60956a`).
+  - Per-draw dirty-upload checks skip surfaces already initialized, clean,
+    and owned by this device — in `SetTexture`'s bind path and in the shared
+    `DDrawDirtySurfaceUpload()` used by every draw/flush site (`b89501d5a`),
+    removing per-bind upload overhead for the same-few-textures busy case.
 - **Cache invalidation**: applying a state block and a successful swapchain
   reset invalidate all dedup caches; the reset also flushes a pending batch
   before resetting.
@@ -153,6 +163,59 @@ Commit IDs may change during local autosquash until the final audit, so units
 - The historical measurements in the Research Record below describe their own
   build/flag/workload context and are **not** offered as proof of current
   performance; use the 2026-08-16 results and the Heroic workflow instead.
+
+
+### Hot-path audit (2026-08-22)
+
+A full read of every hot-path function in `d3d7_device.cpp`,
+`ddraw7_surface.cpp`, `d3d_common_device.*`, and the DXVK D3D9 draw entry
+points (post-`b89501d5a`) found the wrapper layer at its practical floor:
+
+- Input dedup sits above `LockDevice`, translation, and lambda construction
+  in all three state setters; caches update only on success; the color-key
+  bridge is value-keyed. No removable per-call work remains.
+- Batch append is memcpy-only; FVF size is memoized; `SetD3D9FVF` deduped;
+  strip/fan expansion preserves winding and provoking vertices.
+- No logging remains on hot paths (all warns are error/cold gated).
+
+Cross-check against the in-tree DXVK (`src/d3d9/d3d9_device.cpp`): non-UP
+`DrawPrimitive` packs consecutive draws' arguments into one CS command, but
+`DrawPrimitiveUP` still pays a separate `EmitCs` per call carrying a bind +
+draw + unbind triple — so the D7VK-side vertex batching remains load-bearing,
+and merging further at the D7VK layer cannot help.
+
+### Chained UP-draw CS packing (`d3d9.chainUPDraws`) — shipped, default off
+
+Implemented 2026-08-22 in the in-tree DXVK D3D9 layer
+(`D3D9DeviceEx::DrawPrimitiveUP`): consecutive `DrawPrimitiveUP` calls that
+share the vertex declaration and stride append their draw args into a single
+CS command (one bind + N draws + one unbind) instead of a full emit per call.
+Chains close automatically on any intervening CS command (`EmitCs` resets
+`m_csDataType`) and at chunk dispatch (`EmitCsChunk` clears chain state; the
+command lambda captures its `DxvkBufferSlice`/stride by value so it stays
+valid even when the chunk is dispatched before the CS thread executes it).
+A first version crashed RO instantly by reading device members at execution
+time that had already been cleared at dispatch time.
+
+Live A/B on uaRO, native Wayland, logged-in character standing still,
+powersave governor, 30 s MangoHud auto-log per leg (~46k frames each):
+
+| metric | ON | OFF | delta |
+| --- | --- | --- | --- |
+| average FPS | 1562.9 | 1576.3 | −13.4 (−0.9%) |
+| p50 FPS | 1572.5 | 1585.5 | −13.0 |
+| p97 FPS | 1751.8 | 1765.1 | −13.3 |
+| 1% low FPS | 1002.5 | 879.7 | +122.8 |
+| frametime p99.9 (ms) | 1.384 | 1.547 | −0.163 |
+| GPU load | 69% | 69% | ±0 |
+
+Verdict: **no throughput win** — −0.9% average is inside run-to-run noise for
+this scene, and GPU load is identical. The frame-time tail is tighter under
+chaining (1% low +14%, p99.9 −10%), consistent with fewer CS dispatches
+smoothing submission spikes. The flag stays **default off**: enable with
+`d3d9.chainUPDraws = True` if frame-time consistency matters more than peak
+FPS. The wrapper-layer floor stands: remaining wins require attacking the
+texture-bind wall (deferred FF rewrite).
 
 ---
 

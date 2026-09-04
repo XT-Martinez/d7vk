@@ -80,6 +80,10 @@ namespace dxvk {
       return m_inScene;
     }
 
+    bool IsWindowed() const {
+      return m_params9.Windowed;
+    }
+
     GUID GetDeviceGUID() const {
       return m_deviceGUID;
     }

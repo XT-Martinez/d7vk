@@ -3152,24 +3152,54 @@ namespace dxvk {
     const uint32_t dataSize = GetUPDataSize(vertexCount, VertexStreamZeroStride);
     const uint32_t bufferSize = GetUPBufferSize(vertexCount, VertexStreamZeroStride);
 
+    // Chain consecutive UP draws that share the same declaration and stride
+    // into a single CS command: one bind + N draws + one unbind, with each
+    // draw's firstVertex offset relative to the chain's base slice. Mirrors
+    // the CS-chunk draw-arg batching of non-UP DrawPrimitive for the UP path,
+    // which RO-style 2D engines hammer thousands of times per frame.
+    if (m_d3d9Options.chainUPDraws
+        && m_csDataType == D3D9CmdType::DrawUP
+        && m_upChainStride == VertexStreamZeroStride
+        && m_state.vertexDecl == m_upChainDecl) {
+      auto* drawArgs = m_csChunk->pushData(m_csData, 1u);
+
+      if (likely(drawArgs)) {
+        new (drawArgs) VkDrawIndirectCommand{
+          vertexCount, 1u, uint32_t(m_chainVertexOffset), 0u };
+        m_chainVertexOffset += vertexCount;
+        return D3D_OK;
+      }
+    }
+
     auto upSlice = AllocUPBuffer(bufferSize);
     FillUPVertexBuffer(upSlice.mapPtr, pVertexStreamZeroData, dataSize, bufferSize);
 
-    EmitCs([this,
-      cBufferSlice  = std::move(upSlice.slice),
-      cPrimType     = PrimitiveType,
-      cStride       = VertexStreamZeroStride,
-      cVertexCount  = vertexCount
-    ](DxvkContext* ctx) mutable {
-      // Tests on Windows show that D3D9 does not do non-indexed instanced draws.
-      VkDrawIndirectCommand draw = { };
-      draw.vertexCount = cVertexCount;
-      draw.instanceCount = 1u;
+    // The command must be fully self-contained: capture the buffer slice and
+    // stride by value. Device-side chain members are CPU bookkeeping only —
+    // they get cleared in EmitCsChunk when the chunk is dispatched, which can
+    // happen before the CS thread executes this command.
+    DxvkCsDataBlock* block = EmitCsCmd<VkDrawIndirectCommand>(D3D9CmdType::DrawUP, 1u,
+      [this,
+       cBufferSlice = std::move(upSlice.slice),
+       cStride      = VertexStreamZeroStride
+      ] (DxvkContext* ctx, const VkDrawIndirectCommand* drawArgs, uint32_t drawCount) mutable {
+        ctx->bindVertexBuffer(0, std::move(cBufferSlice), cStride);
+        ctx->draw(drawCount, drawArgs);
+        ctx->bindVertexBuffer(0, DxvkBufferSlice(), 0);
+      });
 
-      ctx->bindVertexBuffer(0, std::move(cBufferSlice), cStride);
-      ctx->draw(1u, &draw);
-      ctx->bindVertexBuffer(0, DxvkBufferSlice(), 0);
-    });
+    // Chain bookkeeping for subsequent draws. A failed emit (chunk submit
+    // raced a flush) leaves no live command; start over on the next call.
+    if (likely(block)) {
+      new (block->first()) VkDrawIndirectCommand{
+        vertexCount, 1u, 0u, 0u };
+
+      if (m_d3d9Options.chainUPDraws) {
+        m_upChainStride     = VertexStreamZeroStride;
+        m_upChainDecl       = m_state.vertexDecl;
+        m_chainVertexOffset = vertexCount;
+      }
+    }
 
     m_state.vertexBuffers[0].vertexBuffer = nullptr;
     m_state.vertexBuffers[0].offset       = 0;
@@ -3177,6 +3207,7 @@ namespace dxvk {
     m_state.vertexBuffers[0].stride       = 0;
     return D3D_OK;
   }
+
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitiveUP(
@@ -5865,6 +5896,24 @@ namespace dxvk {
     }
   }
 
+  void D3D9DeviceEx::EmitCsChunk(DxvkCsChunkRef&& chunk) {
+    // Flush init commands so that the CS thread
+    // can processe them before the first use.
+    m_initializer->FlushCsChunk();
+
+    // Reset last CS command since it is no longer safe to access
+    m_csDataType = D3D9CmdType::None;
+    m_csData = nullptr;
+    m_upChainDecl = nullptr;
+
+    // Constant buffers may hold a pointer into the current chunk,
+    // reset that here so the data won't get overwritten.
+    for (auto& cbv : m_constantBuffers)
+      cbv.ResetStreamCommand();
+
+    m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
+  }
+
 
   const D3D9ConstantBufferCopy* D3D9DeviceEx::GetOrCreateConstantLayout(
           D3D9ConstantBufferLayout  FloatLayout,
@@ -5885,24 +5934,6 @@ namespace dxvk {
           DxvkCsChunkRef&&            Chunk,
           bool                        Synchronize) {
     m_csThread.injectChunk(DxvkCsQueue::HighPriority, std::move(Chunk), Synchronize);
-  }
-
-
-  void D3D9DeviceEx::EmitCsChunk(DxvkCsChunkRef&& chunk) {
-    // Flush init commands so that the CS thread
-    // can processe them before the first use.
-    m_initializer->FlushCsChunk();
-
-    // Reset last CS command since it is no longer safe to access
-    m_csDataType = D3D9CmdType::None;
-    m_csData = nullptr;
-
-    // Constant buffers may hold a pointer into the current chunk,
-    // reset that here so the data won't get overwritten.
-    for (auto& cbv : m_constantBuffers)
-      cbv.ResetStreamCommand();
-
-    m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
   }
 
 

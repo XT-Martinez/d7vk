@@ -52,6 +52,7 @@ namespace dxvk {
   enum class D3D9CmdType : uint32_t {
     None,
     Draw,
+    DrawUP,
     DrawIndexed,
   };
 
@@ -1715,6 +1716,14 @@ namespace dxvk {
 
     D3D9CmdType                     m_csDataType = D3D9CmdType::None;
     DxvkCsDataBlock*                m_csData = nullptr;
+
+    // Chained UP-draw state (see D3D9CmdType::DrawUP). CPU-side bookkeeping
+    // of the open chain (stride, declaration, running vertex offset) so
+    // consecutive DrawPrimitiveUP calls can append draw args into one CS
+    // command. Cleared whenever a chunk is dispatched.
+    uint32_t                        m_upChainStride = 0u;
+    Com<D3D9VertexDecl, false>      m_upChainDecl   = nullptr;
+    uint32_t                        m_chainVertexOffset = 0u;
 
     Rc<sync::Fence>                 m_submissionFence;
     uint64_t                        m_submissionId = 0ull;

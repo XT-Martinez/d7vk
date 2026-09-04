@@ -172,6 +172,12 @@ namespace dxvk {
 
     /// Add an extra front buffer to make GetFrontBufferData() work correctly when the swapchain only has a single buffer
     bool extraFrontbuffer;
+
+    /// Chain consecutive DrawPrimitiveUP calls that share the same vertex
+    /// declaration and stride into a single CS command (one vertex buffer
+    /// bind and one draw-arg batch). Benefits UP-heavy 2D engines; off by
+    /// default since it trades per-draw CS dispatch for larger CS chunks.
+    bool chainUPDraws;
   };
 
 }

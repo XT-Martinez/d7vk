@@ -66,7 +66,7 @@ namespace dxvk {
     // drives D3D7 from multiple threads concurrently.
     , m_multithread ( FALSE )
     , m_rt ( pSurface ) {
-    m_batchVertices.reserve(64u * 1024u);
+    m_batchVertices.reserve(128u * 1024u);
 
     if (m_parent != nullptr) {
       m_commonIntf = m_parent->GetCommonInterface();
@@ -1555,10 +1555,21 @@ namespace dxvk {
     if (unlikely(commonSurface->GetCommonD3DDevice() != m_commonD3DDevice.ptr()))
       commonSurface->DirtyDDrawSurface();
 
-    HRESULT hr = surface7->InitializeOrUploadD3D9();
-    if (unlikely(FAILED(hr))) {
-      Logger::err("D3D7Device::SetTexture: Failed to initialize/upload D3D9 texture");
-      return hr;
+    HRESULT hr;
+    // Skip redundant upload when already clean and initialized on this
+    // device (mirrors DDrawDirtySurfaceUpload's early-out). This shaves
+    // the per-bind InitializeOrUploadD3D9 cost that dominates busy scenes
+    // (~1.3k binds/frame, mostly the same few textures).
+    if (likely(commonSurface->IsInitialized()
+            && !commonSurface->IsDDrawSurfaceDirty()
+            && commonSurface->GetCommonD3DDevice() == m_commonD3DDevice.ptr())) {
+      hr = D3D_OK;
+    } else {
+      hr = surface7->InitializeOrUploadD3D9();
+      if (unlikely(FAILED(hr))) {
+        Logger::err("D3D7Device::SetTexture: Failed to initialize/upload D3D9 texture");
+        return hr;
+      }
     }
 
     // Don't fast skip, since color key might change
@@ -1749,10 +1760,34 @@ namespace dxvk {
 
     // In the case of D3DTSS_ADDRESS, which is exclusive to D3D7
     // and D3D6, we need to set up both D3DTSS_ADDRESSU and D3DTSS_ADDRESSV.
-    // Excluded from input dedup (see IsSlowPathD3D7Tss).
+    // Excluded from input dedup (see IsSlowPathD3D7Tss). Fuse into a single
+    // FlushDrawBatch so two sampler updates don't flush twice.
     if (d3dTexStageStateType == D3DTSS_ADDRESS) {
-      trySetSampler(d3d9::D3DSAMP_ADDRESSU, dwState);
-      return trySetSampler(d3d9::D3DSAMP_ADDRESSV, dwState);
+      const uint32_t uIdx = uint32_t(d3d9::D3DSAMP_ADDRESSU);
+      const uint32_t vIdx = uint32_t(d3d9::D3DSAMP_ADDRESSV);
+      const bool uHit = canDedup && uIdx < MaxD3D9SamplerState && m_d3d9SsCacheValid[dwStage][uIdx] && m_d3d9SsCache[dwStage][uIdx] == dwState;
+      const bool vHit = canDedup && vIdx < MaxD3D9SamplerState && m_d3d9SsCacheValid[dwStage][vIdx] && m_d3d9SsCache[dwStage][vIdx] == dwState;
+      if (uHit && vHit)
+        return D3D_OK;
+      FlushDrawBatch();
+      HRESULT hrU = D3D_OK, hrV = D3D_OK;
+      if (!uHit) {
+        hrU = device9->SetSamplerState(dwStage, d3d9::D3DSAMP_ADDRESSU, dwState);
+        if (canDedup && likely(SUCCEEDED(hrU))) {
+          m_d3d9SsCache[dwStage][uIdx]      = dwState;
+          m_d3d9SsCacheValid[dwStage][uIdx] = true;
+        }
+        if (FAILED(hrU))
+          return hrU;
+      }
+      if (!vHit) {
+        hrV = device9->SetSamplerState(dwStage, d3d9::D3DSAMP_ADDRESSV, dwState);
+        if (canDedup && likely(SUCCEEDED(hrV))) {
+          m_d3d9SsCache[dwStage][vIdx]      = dwState;
+          m_d3d9SsCacheValid[dwStage][vIdx] = true;
+        }
+      }
+      return hrV;
     }
 
     d3d9::D3DSAMPLERSTATETYPE stateType = ConvertSamplerStateType(d3dTexStageStateType);
