@@ -4,7 +4,7 @@ This document records the Ragnarok Online (uaRO) performance work that has
 landed in this repository. It has two parts:
 
 - **Current State** — what the current tree actually implements, keyed to the
-  final four-commit series and the upstream base it was transplanted onto.
+  current commit series and the upstream base it is rebased onto.
 - **Historical Research Record** — the chronological record of the earlier
   optimization research, kept for context. Everything in that section is
   historical: the experiments and environment flags it describes are **not**
@@ -16,39 +16,60 @@ to build, install, and measure the current tree.
 
 ---
 
-## Current State (2026-08-22)
+## Current State (2026-10-23)
 
 ### Branch and anchor
 
-This branch (`d3d7-ro-latest-devel`) is a **fresh transplant** on the latest
-verified upstream default branch (`origin/devel` of WinterSnowfall/d7vk),
-frozen at:
+This branch (`d3d7-ro-rebase-20261023`, pushed to the personal fork
+`XT-Martinez/d7vk`) carries the RO series on top of upstream `origin/devel`
+of WinterSnowfall/d7vk, frozen at:
 
 ```
-c0fe0f78b241913ca391e5c90a797aaa1d374398   (2026-08-14)
+a339262ab426d5bde0bf9e051a32d4d55ae8c56f   (2026-10-21)
 ```
 
-It is not a merge or replay of rewritten upstream history. Because upstream
-force-rewrote its history again, the earlier personal branches
-(`d3d7-perf-profiling`, `d3d7-ro-migrate`) are preserved unmoved as historical
-source material and were **not** merged. Only the intended runtime surfaces
-were grafted onto the fresh root, and latest upstream implementations of the
-shared code remain authoritative wherever they exist.
+Upstream force-rewrites its history periodically, so the RO series is
+re-applied with `git rebase --onto origin/devel <old-base>` rather than merged.
+Latest upstream implementations of shared code remain authoritative wherever
+they overlap with ours.
 
-### Final four-commit series
+Rebase history:
 
-The four topical units are identified by their exact stable subjects; the
-frozen base SHA above remains exact:
+- **2026-08-14** — fresh transplant onto `c0fe0f78b` (branch
+  `d3d7-ro-latest-devel`). The earlier personal branches
+  (`d3d7-perf-profiling`, `d3d7-ro-migrate`) are preserved unmoved as
+  historical source material and were not merged.
+- **2026-09-04** — rebased onto `a01d45d03` (branch
+  `d3d7-ro-rebase-20260904`, kept as the fallback).
+- **2026-10-23** — rebased onto `a339262ab`. Upstream had rewritten history
+  again; `a01d45d03` corresponds to upstream `56c340c54`, so 33 genuinely new
+  upstream commits were picked up (all d3d7/ddraw frontend work, no new DXVK
+  core changes). Notable ones: vertex buffer lock tracking rework, cube texture
+  per-face upload optimization, stretch-to-fit / aspect-ratio presentation
+  (`GetPresentRect()`), GDI surface tracking, and `GetDesc2()` renamed to
+  `GetDesc()` on `DDrawCommonSurface`. Integration notes:
+  - `SetTexture` unbind follows upstream's unconditional
+    `SetColorKeyState(stage, false)`; our D3D9 texture cache and stage-0
+    color-key cache are layered on top of it.
+  - `Flip` flushes pending draws, then presents with upstream's `presentRect`.
+  - The clean-surface upload skip in `SetTexture` was re-checked against
+    upstream's `InitializeOrUploadD3D9()`, which is still a no-op for an
+    initialized, clean surface owned by the current device.
 
-1. `09e3c7a09` — `[meta] Add Podman build container and ignore local outputs`
+### Commit series
+
+Identified by subject (SHAs change on every rebase), oldest first:
+
+1. `[meta] Add Podman build container and ignore local outputs`
 2. `[d3d7] Restore RO state dedup and draw batching optimizations`
 3. `[ddraw7] Restore current-RT scratch lock and fullscreen present fix`
-4. `[docs] Consolidate Ragnarok optimization findings` — this documentation
-   commit (it cannot record its own final SHA, since a commit ID is derived
-   from the commit's content).
-
-Commit IDs may change during local autosquash until the final audit, so units
-2–4 are referenced by subject rather than SHA.
+4. `[docs] Consolidate Ragnarok optimization findings`
+5. `[ddraw7] Avoid render-target readback before presentation`
+6. `[docs] Document Heroic Ragnarok validation workflow`
+7. `[ddraw7] Trim scratch lock and presentation overhead`
+8. `[d3d7] Skip redundant clean surface uploads`
+9. `[WIP] chainUPDraws + 2026-08-22 refinements` — the `d3d9.chainUPDraws`
+   option plus the 2026-08-22 refinements, committed as one snapshot.
 
 ### Current implementation inventory
 
@@ -97,13 +118,16 @@ Commit IDs may change during local autosquash until the final audit, so units
   boundary is handled. Dedup hits do not flush.
   Refinements from the 2026-08-16 follow-up commits:
   - The scratch current-RT `Lock` fast path returns before any batch flush
-    (`bb4669599`); non-scratch locks and writable locks still flush first.
+    (`Trim scratch lock and presentation overhead`); non-scratch locks and
+    writable locks still flush first.
   - The windowed RT-present early-out in destination `Blt`/`BltFast` runs
     **before** the download/write-back block, so an RT-to-primary present no
-    longer pays a render-target readback (`17b60956a`).
+    longer pays a render-target readback (`Avoid render-target readback
+    before presentation`).
   - Per-draw dirty-upload checks skip surfaces already initialized, clean,
     and owned by this device — in `SetTexture`'s bind path and in the shared
-    `DDrawDirtySurfaceUpload()` used by every draw/flush site (`b89501d5a`),
+    `DDrawDirtySurfaceUpload()` used by every draw/flush site (`Skip redundant
+    clean surface uploads`),
     removing per-bind upload overhead for the same-few-textures busy case.
 - **Cache invalidation**: applying a state block and a successful swapchain
   reset invalidate all dedup caches; the reset also flushes a pending batch
@@ -149,10 +173,13 @@ Commit IDs may change during local autosquash until the final audit, so units
 
 ### Validation status
 
-- A 32-bit release build of the transplanted series completed in the Podman
-  container (**283/283 targets**) and produced
-  `out-builds/verify-ro-latest/d7vk-ro-latest/x32/ddraw.dll` (PE32 i386).
-- Two independent code reviewers found no blockers or warnings.
+- **2026-10-23 rebase:** a 32-bit release build completed cleanly in the
+  Podman container (no warnings in the RO-touched files) and produced
+  `out-builds/rebase-20261023/d7vk-rebase-20261023/x32/ddraw.dll`
+  (PE32 i386). **Not yet validated in-game**; the previous validated build is
+  kept at `out-builds/verify-ro-rebase-20260904/`.
+- 2026-08 transplant: 283/283 build targets; two independent code reviewers
+  found no blockers or warnings.
 - Validated live on **2026-08-16** through the Heroic runner; the full
   discovery → back-up → hash → deploy → launch → verify → benchmark → restore
   workflow is documented in [`ragnarok-profiling.md`](ragnarok-profiling.md).
@@ -169,7 +196,7 @@ Commit IDs may change during local autosquash until the final audit, so units
 
 A full read of every hot-path function in `d3d7_device.cpp`,
 `ddraw7_surface.cpp`, `d3d_common_device.*`, and the DXVK D3D9 draw entry
-points (post-`b89501d5a`) found the wrapper layer at its practical floor:
+points (after `Skip redundant clean surface uploads`) found the wrapper layer at its practical floor:
 
 - Input dedup sits above `LockDevice`, translation, and lambda construction
   in all three state setters; caches update only on success; the color-key
